@@ -14,6 +14,14 @@
   const ANSWER_SECONDS = 60;
   const BUZZ_REVEAL_MS = 1200;
   const MAX_SKIPS = 3;
+  /**
+   * TARGET chain length ≈ this fraction of participants (floored), min 2.
+   * Tunable without touching Mode 1. Examples with 0.6:
+   * 3→2, 4→2, 5→3, 6→3, 7→4, 8→4, 9→5, 10→5
+   */
+  const TARGET_CHAIN_RATIO = 0.6;
+  const TARGET_MIN_PLAYERS = 3;
+  const TARGET_REVEAL_MS = 1600;
 
   const SUPABASE_URL = window.SUPABASE_CONFIG?.url || "";
   const SUPABASE_KEY = window.SUPABASE_CONFIG?.publishableKey || "";
@@ -34,6 +42,7 @@
     lobby: $("#screen-lobby"),
     questions: $("#screen-questions"),
     game: $("#screen-game"),
+    target: $("#screen-target"),
     finals: $("#screen-finals"),
     end: $("#screen-end"),
   };
@@ -94,6 +103,7 @@
     confirmMessage: $("#confirm-message"),
     confirmCancel: $("#confirm-cancel"),
     confirmOk: $("#confirm-ok"),
+    targetStage: $("#target-stage"),
   };
 
   // Editorial palette — matches iso-theme guy accents
@@ -349,6 +359,43 @@
 
     if (state.phase === "answering") {
       armAnswerTimeout();
+    }
+
+    if (!isTargetPhase() || !state.target) return;
+    const stage = state.target.stage;
+    if (stage === "reveal_q") {
+      scheduleTargetReveal();
+    } else if (stage === "reveal_target") {
+      clearTargetRevealTimer();
+      targetRevealTimer = setTimeout(() => {
+        targetRevealTimer = null;
+        if (!me.isHost || !state?.target) return;
+        if (state.target.stage !== "reveal_target") return;
+        state.target.stage = "choose";
+        publish();
+      }, 800);
+    } else if (stage === "continue") {
+      clearTargetRevealTimer();
+      targetRevealTimer = setTimeout(() => {
+        targetRevealTimer = null;
+        if (!me.isHost || !state?.target) return;
+        if (state.target.stage !== "continue") return;
+        const next = state.target.chainIndex + 1;
+        if (next >= (state.target.chain?.length || 0)) {
+          finishTargetSuccess();
+          return;
+        }
+        state.target.chainIndex = next;
+        state.target.stage = "reveal_q";
+        publish();
+        scheduleTargetReveal();
+      }, 1000);
+    } else if (stage === "broken" || stage === "complete") {
+      clearTargetRevealTimer();
+      targetRevealTimer = setTimeout(() => {
+        targetRevealTimer = null;
+        if (me.isHost) endTargetAndResumeMode1();
+      }, 1200);
     }
   }
 
@@ -889,6 +936,7 @@
       questionsLocked,
       lateJoinIds,
       finals,
+      target,
       winnerId,
       revealForId,
       finalsAnswerScores,
@@ -913,6 +961,7 @@
       questionsLocked: !!questionsLocked,
       lateJoinIds: Array.isArray(lateJoinIds) ? lateJoinIds : [],
       finals,
+      target: target || null,
       winnerId,
       revealForId,
       finalsAnswerScores: finalsAnswerScores || null,
@@ -957,6 +1006,7 @@
       questionsLocked: false,
       lateJoinIds: [],
       finals: null,
+      target: null,
       winnerId: null,
       revealForId: null,
       finalsAnswerScores: null,
@@ -1101,6 +1151,17 @@
         );
 
         if (joinPlayer) {
+          const phaseNow = room.phase || game.phase || "lobby";
+          const alreadyIn = players.some((p) => p.id === joinPlayer.id);
+          if (
+            !resume &&
+            !alreadyIn &&
+            (phaseNow === "target_setup" || phaseNow === "target_active")
+          ) {
+            throw new Error(
+              "TARGET is currently in progress. You can join when the round is over."
+            );
+          }
           const taken = players.some(
             (p) =>
               p.id !== joinPlayer.id &&
@@ -1112,7 +1173,7 @@
               "That name is already taken in this room. Pick another."
             );
           }
-          if (!players.some((p) => p.id === joinPlayer.id)) {
+          if (!alreadyIn) {
             await this.addPlayer(joinPlayer);
           }
         }
@@ -1542,6 +1603,282 @@
     return Promise.resolve();
   }
 
+  // ---------- TARGET mode (mid-game special round) ----------
+  function isTargetPhase(st = state) {
+    return st?.phase === "target_setup" || st?.phase === "target_active";
+  }
+
+  /** Chain length from participant count — single tunable entry point. */
+  function targetChainLength(participantCount) {
+    const n = Math.max(0, participantCount | 0);
+    if (n < 2) return 0;
+    // floor(n * ratio), at least 2, never more than submissions available
+    return Math.max(2, Math.min(n, Math.floor(n * TARGET_CHAIN_RATIO)));
+  }
+
+  function targetParticipants(st = state) {
+    const ids = st?.target?.participantIds || [];
+    return ids
+      .map((id) => getPlayer(id, st))
+      .filter((p) => p && !p.kicked);
+  }
+
+  function targetSubmissionCount(st = state) {
+    const subs = st?.target?.submissions || {};
+    return targetParticipants(st).filter((p) => subs[p.id]?.text && subs[p.id]?.targetId)
+      .length;
+  }
+
+  function allTargetsSubmitted(st = state) {
+    const parts = targetParticipants(st);
+    if (!parts.length) return false;
+    const subs = st?.target?.submissions || {};
+    return parts.every((p) => subs[p.id]?.text && subs[p.id]?.targetId);
+  }
+
+  function currentTargetItem(st = state) {
+    const t = st?.target;
+    if (!t?.chain?.length) return null;
+    return t.chain[t.chainIndex] || null;
+  }
+
+  function canStartTarget() {
+    if (!me.isHost || !state) return false;
+    if (isTargetPhase() || state.phase === "lobby" || state.phase === "finals" || state.phase === "end") {
+      return false;
+    }
+    // During Mode 1 play (pool open or wheel)
+    if (!["questions", "spinning", "answering", "confirm"].includes(state.phase)) {
+      return false;
+    }
+    return activePlayers().length >= TARGET_MIN_PLAYERS;
+  }
+
+  function beginTargetRound() {
+    const parts = activePlayers();
+    if (parts.length < TARGET_MIN_PLAYERS) {
+      toast(`Need at least ${TARGET_MIN_PLAYERS} players for TARGET`);
+      return;
+    }
+    clearAnswerTimers();
+    const resumePhase = state.phase;
+    state.target = {
+      stage: "intro",
+      participantIds: parts.map((p) => p.id),
+      submissions: {},
+      chain: [],
+      chainIndex: 0,
+      resumePhase,
+      brokenById: null,
+      brokenName: null,
+    };
+    state.phase = "target_setup";
+    state.currentPlayerId = null;
+    state.currentQuestionId = null;
+    state.answerEndsAt = null;
+    publish();
+    toast("TARGET — joining locked until this round ends");
+  }
+
+  function lockTargetChainAndPlay() {
+    if (!state?.target) return;
+    const alive = targetParticipants();
+    const subs = state.target.submissions || {};
+    const pool = [];
+    alive.forEach((p) => {
+      const s = subs[p.id];
+      if (!s?.text || !s?.targetId) return;
+      const target = getPlayer(s.targetId);
+      if (!target || target.kicked) return;
+      if (s.targetId === p.id) return;
+      pool.push({
+        id: uid(),
+        text: String(s.text).trim(),
+        authorId: p.id, // internal only — never shown in UI
+        targetId: s.targetId,
+      });
+    });
+    shuffleInPlace(pool);
+    const need = targetChainLength(alive.length);
+    state.target.chain = pool.slice(0, Math.min(need, pool.length));
+    state.target.chainIndex = 0;
+    state.target.brokenById = null;
+    state.target.brokenName = null;
+    if (!state.target.chain.length) {
+      toast("TARGET cancelled — no valid questions");
+      endTargetAndResumeMode1();
+      return;
+    }
+    state.phase = "target_active";
+    state.target.stage = "reveal_q";
+    publish();
+    scheduleTargetReveal();
+  }
+
+  let targetRevealTimer = null;
+  function clearTargetRevealTimer() {
+    if (targetRevealTimer) {
+      clearTimeout(targetRevealTimer);
+      targetRevealTimer = null;
+    }
+  }
+
+  function scheduleTargetReveal() {
+    clearTargetRevealTimer();
+    if (!me.isHost || !state?.target) return;
+    if (state.target.stage !== "reveal_q") return;
+    const token = state.target.chainIndex;
+    targetRevealTimer = setTimeout(() => {
+      targetRevealTimer = null;
+      if (!me.isHost || !state?.target) return;
+      if (state.phase !== "target_active") return;
+      if (state.target.stage !== "reveal_q") return;
+      if (state.target.chainIndex !== token) return;
+      state.target.stage = "reveal_target";
+      publish();
+      // Brief beat then open choices
+      targetRevealTimer = setTimeout(() => {
+        targetRevealTimer = null;
+        if (!me.isHost || !state?.target) return;
+        if (state.target.stage !== "reveal_target") return;
+        state.target.stage = "choose";
+        publish();
+      }, Math.min(TARGET_REVEAL_MS, 1200));
+    }, TARGET_REVEAL_MS);
+  }
+
+  function advanceTargetAfterAnswer() {
+    if (!state?.target) return;
+    const next = state.target.chainIndex + 1;
+    if (next >= (state.target.chain?.length || 0)) {
+      finishTargetSuccess();
+      return;
+    }
+    state.target.chainIndex = next;
+    state.target.stage = "continue";
+    publish();
+    clearTargetRevealTimer();
+    targetRevealTimer = setTimeout(() => {
+      targetRevealTimer = null;
+      if (!me.isHost || !state?.target) return;
+      if (state.target.stage !== "continue") return;
+      state.target.stage = "reveal_q";
+      publish();
+      scheduleTargetReveal();
+    }, 1400);
+  }
+
+  function breakTargetChain(player) {
+    if (!state?.target || !player) return;
+    player.kicked = true;
+    state.target.brokenById = player.id;
+    state.target.brokenName = player.name;
+    state.target.stage = "broken";
+    clearTargetRevealTimer();
+    clearAnswerTimers();
+    publish();
+    // Show broken beat, then resume Mode 1
+    targetRevealTimer = setTimeout(() => {
+      targetRevealTimer = null;
+      if (!me.isHost || !state?.target) return;
+      if (state.target.stage !== "broken") return;
+      endTargetAndResumeMode1();
+    }, 2800);
+  }
+
+  function finishTargetSuccess() {
+    if (!state?.target) return;
+    state.target.stage = "complete";
+    clearTargetRevealTimer();
+    publish();
+    targetRevealTimer = setTimeout(() => {
+      targetRevealTimer = null;
+      if (!me.isHost) return;
+      endTargetAndResumeMode1();
+    }, 1600);
+  }
+
+  function endTargetAndResumeMode1() {
+    clearTargetRevealTimer();
+    state.target = null;
+    state.currentPlayerId = null;
+    state.currentQuestionId = null;
+    state.answerEndsAt = null;
+    toast("Back to Icebreaker");
+    if (activePlayers().length <= 0) {
+      state.phase = "end";
+      state.winnerId = null;
+      publish();
+      return;
+    }
+    if (activePlayers().length === 1) {
+      state.phase = "end";
+      state.winnerId = activePlayers()[0].id;
+      state.revealForId = pickAuthorRevealId();
+      publish();
+      return;
+    }
+    if (shouldGoToFinals()) {
+      startFinals();
+      return;
+    }
+    beginWheelRound();
+  }
+
+  /**
+   * Participant left during TARGET setup — drop them from the freeze list
+   * and invalidate any submissions that targeted them.
+   */
+  function purgeTargetParticipant(playerId) {
+    if (!state?.target || !playerId) return;
+    state.target.participantIds = (state.target.participantIds || []).filter(
+      (id) => id !== playerId
+    );
+    if (state.target.submissions) {
+      delete state.target.submissions[playerId];
+      Object.keys(state.target.submissions).forEach((aid) => {
+        if (state.target.submissions[aid]?.targetId === playerId) {
+          delete state.target.submissions[aid];
+        }
+      });
+    }
+    // Too few left to run TARGET
+    if (targetParticipants().length < TARGET_MIN_PLAYERS && state.phase === "target_setup") {
+      toast("Not enough players — TARGET cancelled");
+      endTargetAndResumeMode1();
+      return;
+    }
+    if (
+      state.phase === "target_setup" &&
+      state.target.stage === "setup" &&
+      allTargetsSubmitted()
+    ) {
+      lockTargetChainAndPlay();
+    }
+  }
+
+  /** Current target left mid-question — same outcome as SKIP. */
+  function handleTargetLeaveDuringPlay(playerId) {
+    if (!state?.target || state.phase !== "target_active") return false;
+    const item = currentTargetItem();
+    if (item && item.targetId === playerId) {
+      const p = getPlayer(playerId);
+      if (p) breakTargetChain(p);
+      else {
+        state.target.brokenById = playerId;
+        state.target.brokenName = "Player";
+        state.target.stage = "broken";
+        publish();
+        setTimeout(() => {
+          if (me.isHost) endTargetAndResumeMode1();
+        }, 2800);
+      }
+      return true;
+    }
+    // Not the current target — just remove from roster; chain continues
+    return false;
+  }
+
   function handleAction(action) {
     if (!me.isHost || !state || !action) return;
 
@@ -1552,6 +1889,15 @@
             playerId: action.player.id,
             reason: "ended",
             message: "This game already ended.",
+          });
+          return;
+        }
+        if (isTargetPhase()) {
+          sync?.notifyJoinRejected?.({
+            playerId: action.player.id,
+            reason: "target_lock",
+            message:
+              "TARGET is currently in progress. You can join when the round is over.",
           });
           return;
         }
@@ -1657,6 +2003,30 @@
         if (!leftId || !getPlayer(leftId)) return;
         const name = getPlayer(leftId)?.name || "Player";
         const wasHost = state.hostId === leftId;
+
+        if (isTargetPhase()) {
+          const broke = handleTargetLeaveDuringPlay(leftId);
+          removePlayerFromState(leftId);
+          if (!broke && state?.phase === "target_setup") {
+            purgeTargetParticipant(leftId);
+          }
+          if (wasHost) {
+            const next = nextHostCandidate(null);
+            if (next) {
+              assignHost(next.id);
+              sync?.notifyHostHandoff?.({
+                newHostId: next.id,
+                leavingId: leftId,
+              });
+              toast(`${next.name} is the new host`);
+            }
+          }
+          publish();
+          sync?.deletePlayer?.(leftId);
+          toast(`${name} left the room`);
+          break;
+        }
+
         removePlayerFromState(leftId);
         if (wasHost) {
           const next = nextHostCandidate(null);
@@ -1774,8 +2144,16 @@
         const target = getPlayer(targetId);
         if (!target) return;
         const name = target.name;
-        removePlayerFromState(targetId);
-        repairTurnAfterLeave(targetId);
+        if (isTargetPhase()) {
+          const broke = handleTargetLeaveDuringPlay(targetId);
+          removePlayerFromState(targetId);
+          if (!broke && state?.phase === "target_setup") {
+            purgeTargetParticipant(targetId);
+          }
+        } else {
+          removePlayerFromState(targetId);
+          repairTurnAfterLeave(targetId);
+        }
         publish();
         sync?.deletePlayer?.(targetId);
         sync?.notifyPlayerKicked?.({
@@ -1851,6 +2229,67 @@
         if (state.finals.phase === "ready" || state.finals.phase === "show") {
           openFinalsQuestion();
         }
+        break;
+      }
+      case "startTarget": {
+        if (action.playerId !== state.hostId) return;
+        if (!canStartTarget()) return;
+        beginTargetRound();
+        break;
+      }
+      case "targetBegin": {
+        // Host or any participant can ack intro → setup (host authoritative)
+        if (!state.target || state.phase !== "target_setup") return;
+        if (state.target.stage !== "intro") return;
+        state.target.stage = "setup";
+        publish();
+        break;
+      }
+      case "targetSubmit": {
+        if (!state.target || state.phase !== "target_setup") return;
+        if (state.target.stage !== "setup") return;
+        const pid = action.playerId;
+        if (!(state.target.participantIds || []).includes(pid)) return;
+        const author = getPlayer(pid);
+        if (!author || author.kicked) return;
+        const text = String(action.text || "").trim();
+        const targetId = action.targetId;
+        if (!text || !targetId) return;
+        if (targetId === pid) return;
+        if (!(state.target.participantIds || []).includes(targetId)) return;
+        const targetPlayer = getPlayer(targetId);
+        if (!targetPlayer || targetPlayer.kicked) return;
+        if (!state.target.submissions) state.target.submissions = {};
+        state.target.submissions[pid] = {
+          text,
+          targetId,
+          submittedAt: Date.now(),
+        };
+        publish();
+        if (allTargetsSubmitted()) {
+          lockTargetChainAndPlay();
+        }
+        break;
+      }
+      case "targetAnswer": {
+        if (!state.target || state.phase !== "target_active") return;
+        if (state.target.stage !== "choose") return;
+        const item = currentTargetItem();
+        if (!item || action.playerId !== item.targetId) return;
+        const player = getPlayer(action.playerId);
+        if (!player || player.kicked) return;
+        if (typeof player.answered === "number") player.answered += 1;
+        advanceTargetAfterAnswer();
+        break;
+      }
+      case "targetSkip": {
+        if (!state.target || state.phase !== "target_active") return;
+        if (state.target.stage !== "choose") return;
+        const item = currentTargetItem();
+        if (!item || action.playerId !== item.targetId) return;
+        const player = getPlayer(action.playerId);
+        if (!player || player.kicked) return;
+        breakTargetChain(player);
         break;
       }
       default:
@@ -2354,9 +2793,16 @@
       !!state &&
       !!me?.id &&
       state.phase !== "end" &&
-      ["lobby", "questions", "spinning", "answering", "confirm", "finals"].includes(
-        state.phase
-      );
+      [
+        "lobby",
+        "questions",
+        "spinning",
+        "answering",
+        "confirm",
+        "finals",
+        "target_setup",
+        "target_active",
+      ].includes(state.phase);
     if (els.btnLeaveRoom) {
       els.btnLeaveRoom.hidden = !inRoom || state.phase === "lobby";
     }
@@ -2394,6 +2840,11 @@
       case "confirm":
         showScreen("game");
         renderGame();
+        break;
+      case "target_setup":
+      case "target_active":
+        showScreen("target");
+        renderTarget();
         break;
       case "finals":
         showScreen("finals");
@@ -2841,6 +3292,26 @@
 
     ensureIdeasPanel();
 
+    // Host can launch TARGET once the pool is live / locked
+    let targetBtn = document.getElementById("btn-start-target-q");
+    if (canStartTarget()) {
+      if (!targetBtn && els.questionForm?.parentElement) {
+        targetBtn = document.createElement("button");
+        targetBtn.type = "button";
+        targetBtn.id = "btn-start-target-q";
+        targetBtn.className = "btn btn-ghost";
+        targetBtn.style.marginTop = "0.5rem";
+        els.questionForm.parentElement.appendChild(targetBtn);
+      }
+      if (targetBtn) {
+        targetBtn.hidden = false;
+        targetBtn.textContent = "Start TARGET round";
+        targetBtn.onclick = () => send({ type: "startTarget", playerId: me.id });
+      }
+    } else if (targetBtn) {
+      targetBtn.hidden = true;
+    }
+
     // Host can remove players during the question pool
     let hostKickList = document.getElementById("host-kick-list");
     if (me.isHost) {
@@ -2958,6 +3429,18 @@
       }
       els.scoreStrip.appendChild(chip);
     });
+
+    // Host: launch TARGET mid-game
+    if (canStartTarget()) {
+      const startT = document.createElement("button");
+      startT.type = "button";
+      startT.className = "btn-kick";
+      startT.textContent = "TARGET";
+      startT.title = "Start a TARGET round";
+      startT.style.marginLeft = "0.35rem";
+      startT.onclick = () => send({ type: "startTarget", playerId: me.id });
+      els.scoreStrip.appendChild(startT);
+    }
 
     const highlightIdx =
       state.phase === "answering" || state.phase === "confirm"
@@ -3109,6 +3592,230 @@
         }
       }
     }
+  }
+
+  function renderTarget() {
+    const root = els.targetStage;
+    if (!root || !state?.target) return;
+    const t = state.target;
+    const parts = targetParticipants();
+    const readyN = targetSubmissionCount();
+    const totalN = parts.length;
+    const amParticipant = (t.participantIds || []).includes(me.id);
+    const self = getPlayer(me.id);
+    const mySub = t.submissions?.[me.id];
+    const item = currentTargetItem();
+    const chainLen = t.chain?.length || targetChainLength(totalN);
+    const chainPos = Math.min((t.chainIndex || 0) + 1, chainLen || 1);
+
+    root.innerHTML = "";
+    const card = document.createElement("div");
+    card.className = "target-card";
+
+    if (t.stage === "intro") {
+      card.innerHTML = `
+        <p class="eyebrow">Special round</p>
+        <h2>TARGET</h2>
+        <p class="lead">Everyone writes one anonymous question and chooses one person. Nobody knows who chose them.</p>
+        <p class="target-progress">${totalN} players in · ${targetChainLength(totalN)} questions will be played</p>
+      `;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-primary btn-lg";
+      btn.textContent = "BEGIN";
+      btn.onclick = () => send({ type: "targetBegin", playerId: me.id });
+      card.appendChild(btn);
+      root.appendChild(card);
+      return;
+    }
+
+    if (t.stage === "setup") {
+      const prog = document.createElement("p");
+      prog.className = "target-progress";
+      prog.textContent = `${readyN} / ${totalN} players ready`;
+      card.appendChild(prog);
+
+      if (!amParticipant || self?.kicked) {
+        const note = document.createElement("p");
+        note.className = "lead";
+        note.textContent = "You’re spectating this TARGET round.";
+        card.appendChild(note);
+      } else if (mySub?.text && mySub?.targetId) {
+        const note = document.createElement("p");
+        note.className = "lead";
+        note.textContent = "You’re in. Waiting on everyone else…";
+        card.appendChild(note);
+      } else {
+        const form = document.createElement("form");
+        form.className = "target-form";
+        form.innerHTML = `
+          <label>
+            <span>Your anonymous question</span>
+            <textarea id="target-q-input" maxlength="200" required placeholder="Ask something only they can answer…"></textarea>
+          </label>
+          <div>
+            <span style="display:block;font-size:0.75rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);margin-bottom:0.35rem">Choose your target</span>
+            <div class="target-pick-grid" id="target-pick-grid"></div>
+          </div>
+          <button type="submit" class="btn btn-primary btn-lg">Lock in</button>
+        `;
+        const grid = form.querySelector("#target-pick-grid");
+        parts
+          .filter((p) => p.id !== me.id)
+          .forEach((p) => {
+            const lab = document.createElement("label");
+            lab.className = "target-pick";
+            lab.innerHTML = `<input type="radio" name="target-pick" value="${p.id.replace(/"/g, "")}" required /> <span>${escapeHtml(p.name)}</span>`;
+            lab.querySelector("input").addEventListener("change", () => {
+              grid.querySelectorAll(".target-pick").forEach((el) => el.classList.remove("is-selected"));
+              lab.classList.add("is-selected");
+            });
+            grid.appendChild(lab);
+          });
+        form.onsubmit = (e) => {
+          e.preventDefault();
+          const text = form.querySelector("#target-q-input")?.value?.trim();
+          const targetId = form.querySelector('input[name="target-pick"]:checked')?.value;
+          if (!text || !targetId) return;
+          send({ type: "targetSubmit", playerId: me.id, text, targetId });
+        };
+        card.appendChild(form);
+      }
+
+      const list = document.createElement("ul");
+      list.className = "target-ready-list";
+      parts.forEach((p) => {
+        const li = document.createElement("li");
+        const done = !!(t.submissions?.[p.id]?.text && t.submissions?.[p.id]?.targetId);
+        if (done) li.classList.add("is-ready");
+        li.innerHTML = `<span>${escapeHtml(p.name)}${p.id === me.id ? " (you)" : ""}</span><span>${done ? "ready" : "writing…"}</span>`;
+        list.appendChild(li);
+      });
+      card.appendChild(list);
+      root.appendChild(card);
+      return;
+    }
+
+    if (t.stage === "broken") {
+      card.classList.add("target-broken");
+      card.innerHTML = `
+        <p class="eyebrow">Chain ended</p>
+        <h2>TARGET BROKEN</h2>
+        <p class="target-nameplate">${escapeHtml(t.brokenName || "Player")} HAS BEEN ELIMINATED</p>
+        <p class="lead">The remaining TARGET questions are wasted. Returning to Icebreaker…</p>
+      `;
+      root.appendChild(card);
+      return;
+    }
+
+    if (t.stage === "complete") {
+      card.innerHTML = `
+        <p class="eyebrow">Round clear</p>
+        <h2>TARGET complete</h2>
+        <p class="lead">Everyone who was asked answered. Back to the wheel…</p>
+      `;
+      root.appendChild(card);
+      return;
+    }
+
+    if (t.stage === "continue") {
+      card.innerHTML = `
+        <p class="eyebrow">Locked in</p>
+        <h2>TARGET continues…</h2>
+        <p class="lead">Next anonymous hit incoming.</p>
+      `;
+      root.appendChild(card);
+      return;
+    }
+
+    // reveal_q / reveal_target / choose
+    const mark = document.createElement("p");
+    mark.className = "target-chain-mark";
+    mark.textContent = `TARGET ${chainPos} / ${chainLen}`;
+    card.appendChild(mark);
+
+    if (!item) {
+      const lead = document.createElement("p");
+      lead.className = "lead";
+      lead.textContent = "Preparing…";
+      card.appendChild(lead);
+      root.appendChild(card);
+      return;
+    }
+
+    const qEl = document.createElement("p");
+    qEl.className = "target-question";
+    qEl.textContent = item.text;
+    card.appendChild(qEl);
+
+    if (t.stage === "reveal_q") {
+      const lead = document.createElement("p");
+      lead.className = "lead";
+      lead.textContent = "Someone in this room wrote this. Nobody knows who.";
+      card.appendChild(lead);
+      root.appendChild(card);
+      return;
+    }
+
+    const targetPlayer = getPlayer(item.targetId);
+    const plate = document.createElement("p");
+    plate.className = "target-nameplate";
+    plate.textContent = `TARGET: ${(targetPlayer?.name || "—").toUpperCase()}`;
+    card.appendChild(plate);
+
+    if (t.stage === "reveal_target") {
+      const lead = document.createElement("p");
+      lead.className = "lead";
+      lead.textContent =
+        item.targetId === me.id
+          ? "That’s you. Get ready."
+          : "Only they can answer — everyone else watches.";
+      card.appendChild(lead);
+      root.appendChild(card);
+      return;
+    }
+
+    // choose
+    if (item.targetId === me.id && self && !self.kicked) {
+      const lead = document.createElement("p");
+      lead.className = "lead";
+      lead.textContent = "Answer out loud — or skip and you’re out of the whole game.";
+      card.appendChild(lead);
+      const row = document.createElement("div");
+      row.className = "target-actions row";
+      const skipBtn = document.createElement("button");
+      skipBtn.type = "button";
+      skipBtn.className = "btn btn-danger";
+      skipBtn.textContent = "SKIP";
+      skipBtn.onclick = async () => {
+        const ok = await showConfirm({
+          eyebrow: "TARGET",
+          title: "Skip?",
+          message:
+            "You will be eliminated from the game. The TARGET chain ends here — later questions are wasted.",
+          cancelLabel: "Stay",
+          okLabel: "Skip & leave game",
+          danger: true,
+        });
+        if (!ok) return;
+        send({ type: "targetSkip", playerId: me.id });
+      };
+      const ansBtn = document.createElement("button");
+      ansBtn.type = "button";
+      ansBtn.className = "btn btn-primary";
+      ansBtn.textContent = "ANSWER";
+      ansBtn.onclick = () => send({ type: "targetAnswer", playerId: me.id });
+      row.appendChild(skipBtn);
+      row.appendChild(ansBtn);
+      card.appendChild(row);
+    } else {
+      const lead = document.createElement("p");
+      lead.className = "lead";
+      lead.textContent = `Waiting for ${targetPlayer?.name || "them"}…`;
+      card.appendChild(lead);
+    }
+
+    root.appendChild(card);
   }
 
   function renderFinals() {
@@ -3485,6 +4192,12 @@
               handleNameTaken("This game already ended.");
               return;
             }
+            if (st.phase === "target_setup" || st.phase === "target_active") {
+              handleNameTaken(
+                "TARGET is currently in progress. You can join when the round is over."
+              );
+              return;
+            }
             const taken = (st.players || []).some(
               (p) =>
                 p.id !== me.id &&
@@ -3666,10 +4379,18 @@
     try {
       if (wasHost) {
         const next = nextHostCandidate(leavingId);
-        removePlayerFromState(leavingId);
+        if (isTargetPhase()) {
+          const broke = handleTargetLeaveDuringPlay(leavingId);
+          removePlayerFromState(leavingId);
+          if (!broke && state?.phase === "target_setup") {
+            purgeTargetParticipant(leavingId);
+          }
+        } else {
+          removePlayerFromState(leavingId);
+          if (next) repairTurnAfterLeave(leavingId);
+        }
         if (next) {
           assignHost(next.id);
-          repairTurnAfterLeave(leavingId);
           await publish();
           await sync?.setRoomHost?.(next.id);
           sync?.notifyHostHandoff?.({
@@ -3678,7 +4399,6 @@
             leavingName,
           });
         } else {
-          // Alone — nothing to hand off; room stays in DB but empty of you
           await publish();
         }
         await sync?.deletePlayer?.(leavingId);
