@@ -88,6 +88,12 @@
     toast: $("#toast"),
     btnLeaveRoom: $("#btn-leave-room"),
     btnLeaveLobby: $("#btn-leave-lobby"),
+    confirmOverlay: $("#confirm-overlay"),
+    confirmEyebrow: $("#confirm-eyebrow"),
+    confirmTitle: $("#confirm-title"),
+    confirmMessage: $("#confirm-message"),
+    confirmCancel: $("#confirm-cancel"),
+    confirmOk: $("#confirm-ok"),
   };
 
   // Editorial palette — matches iso-theme guy accents
@@ -114,6 +120,8 @@
   let wheelSpinning = false;
   let lastSpinToken = -1;
   let wheelRaf = 0;
+  /** After refresh/resume, land the wheel — don’t replay a full spin */
+  let resumeSkipSpinAnim = false;
   let revealCurtainPlayed = false;
   let myLocalQuestions = [];
   let toastTimer = null;
@@ -224,6 +232,10 @@
     return `c1-session-${String(code || "").toUpperCase()}`;
   }
 
+  function reclaimKey(code) {
+    return `c1-reclaim-${String(code || "").toUpperCase()}`;
+  }
+
   const ACTIVE_ROOM_KEY = "c1-active-room";
 
   function saveSession() {
@@ -268,6 +280,46 @@
     } catch (_) {}
   }
 
+  /** Same device + same name can reclaim progress after Leave room. */
+  function saveReclaim(code, payload) {
+    if (!code || !payload?.id || !payload?.name) return;
+    try {
+      localStorage.setItem(
+        reclaimKey(code),
+        JSON.stringify({ ...payload, savedAt: Date.now() })
+      );
+    } catch (_) {}
+  }
+
+  function loadReclaim(code) {
+    try {
+      const raw = localStorage.getItem(reclaimKey(code));
+      return raw ? JSON.parse(raw) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function clearReclaim(code) {
+    try {
+      localStorage.removeItem(reclaimKey(code));
+    } catch (_) {}
+  }
+
+  function snapshotForReclaim(playerId = me.id) {
+    const p = getPlayer(playerId);
+    return {
+      id: playerId,
+      name: (p?.name || me.name || "").trim(),
+      answered: p?.answered ?? 0,
+      skips: p?.skips ?? 0,
+      selections: getSelections(p) || 0,
+      lateJoin: !!p?.lateJoin,
+      kicked: !!p?.kicked,
+      joinedAt: p?.joinedAt || Date.now(),
+    };
+  }
+
   function restoreMyLocalQuestionsFromState() {
     if (!me?.id || !state?.questions) {
       myLocalQuestions = [];
@@ -285,19 +337,59 @@
     if (state.phase === "spinning" && state.currentPlayerId) {
       const token = state.spinToken;
       const playerId = state.currentPlayerId;
-      // Give the wheel a moment to animate for everyone, then open answering
+      // After a refresh, snap the wheel and open answering — don’t wait out a full spin
       setTimeout(() => {
         if (!state || !me.isHost) return;
         if (state.phase !== "spinning") return;
         if (state.spinToken !== token) return;
         if (state.currentPlayerId !== playerId) return;
         openAnsweringPhase({ freshDeadline: !state.answerEndsAt });
-      }, Math.min(SPIN_MS, 1600) + 200);
+      }, 400);
     }
 
     if (state.phase === "answering") {
       armAnswerTimeout();
     }
+  }
+
+  function wheelAngleForIndex(players, targetIndex, token = 0) {
+    const n = Math.max(players.length, 1);
+    const arc = (Math.PI * 2) / n;
+    const idx = Math.max(0, Math.min(n - 1, targetIndex | 0));
+    const jitter = (spinUnit(token, 3) - 0.5) * arc * 0.55;
+    const targetCenter = idx * arc + arc / 2 + jitter;
+    return -Math.PI / 2 - targetCenter;
+  }
+
+  function snapWheelToTarget(players) {
+    if (!state) return;
+    const alive = players || wheelPlayers();
+    if (wheelRaf) {
+      cancelAnimationFrame(wheelRaf);
+      wheelRaf = 0;
+    }
+    wheelSpinning = false;
+    const idx =
+      typeof state.spinTargetIndex === "number" ? state.spinTargetIndex : 0;
+    const token = state.spinToken || 0;
+    wheelAngle = wheelAngleForIndex(alive, idx, token);
+    lastSpinToken = token;
+  }
+
+  /** Redraw the game wheel after layout/resume so the canvas isn’t blank. */
+  function paintGameWheel(players, highlightIndex = -1) {
+    const alive = players || wheelPlayers();
+    requestAnimationFrame(() => {
+      if (!state) return;
+      if (
+        state.phase !== "spinning" &&
+        state.phase !== "answering" &&
+        state.phase !== "confirm"
+      ) {
+        return;
+      }
+      drawWheel(alive, wheelAngle, highlightIndex);
+    });
   }
 
   function clearAnswerTimers() {
@@ -442,6 +534,58 @@
     }, 2600);
   }
 
+  let confirmResolver = null;
+
+  function closeConfirm(result) {
+    if (els.confirmOverlay) els.confirmOverlay.hidden = true;
+    const resolve = confirmResolver;
+    confirmResolver = null;
+    if (resolve) resolve(!!result);
+  }
+
+  /**
+   * In-game confirm — cream card, ink border, matches Icebreaker chrome.
+   * @returns {Promise<boolean>}
+   */
+  function showConfirm({
+    eyebrow = "Hold up",
+    title = "Are you sure?",
+    message = "",
+    cancelLabel = "Stay",
+    okLabel = "Do it",
+    danger = true,
+  } = {}) {
+    if (!els.confirmOverlay) {
+      return Promise.resolve(window.confirm(message || title));
+    }
+    // Replace any open dialog
+    if (confirmResolver) closeConfirm(false);
+
+    if (els.confirmEyebrow) els.confirmEyebrow.textContent = eyebrow;
+    if (els.confirmTitle) els.confirmTitle.textContent = title;
+    if (els.confirmMessage) els.confirmMessage.textContent = message;
+    if (els.confirmCancel) els.confirmCancel.textContent = cancelLabel;
+    if (els.confirmOk) {
+      els.confirmOk.textContent = okLabel;
+      els.confirmOk.classList.toggle("btn-danger", !!danger);
+      els.confirmOk.classList.toggle("btn-primary", !danger);
+    }
+    els.confirmOverlay.hidden = false;
+    // Retrigger pop animation
+    const card = els.confirmOverlay.querySelector(".confirm-card");
+    if (card) {
+      card.style.animation = "none";
+      // force reflow
+      void card.offsetWidth;
+      card.style.animation = "";
+    }
+    els.confirmCancel?.focus();
+
+    return new Promise((resolve) => {
+      confirmResolver = resolve;
+    });
+  }
+
   function setHomeError(msg) {
     if (!msg) {
       els.homeError.hidden = true;
@@ -479,7 +623,10 @@
     sync = null;
     state = null;
     me = { id: null, name: "", isHost: false };
-    if (code) clearSession(code);
+    if (code) {
+      clearSession(code);
+      clearReclaim(code);
+    }
     resetToHomeUi();
     setHomeError(msg);
     toast(msg);
@@ -1408,9 +1555,28 @@
           });
           return;
         }
+        const reclaim = action.reclaim || null;
         const existing = state.players.find((p) => p.id === action.player.id);
+
         if (existing) {
-          // Supabase may have inserted them already — still flag mid-game join
+          if (reclaim) {
+            // Same device/name coming back — restore their seat stats
+            existing.name = String(action.player.name || existing.name || "").trim();
+            existing.answered = reclaim.answered ?? existing.answered ?? 0;
+            existing.skips = reclaim.skips ?? existing.skips ?? 0;
+            existing.kicked = !!reclaim.kicked;
+            existing.lateJoin = !!reclaim.lateJoin;
+            existing.joinedAt = reclaim.joinedAt || existing.joinedAt || Date.now();
+            setSelections(existing, reclaim.selections ?? getSelections(existing));
+            if (existing.lateJoin) markLateJoin(existing.id);
+            else if (state.lateJoinIds) {
+              state.lateJoinIds = state.lateJoinIds.filter((id) => id !== existing.id);
+            }
+            publish();
+            toast(`${existing.name} is back — progress restored`);
+            return;
+          }
+          // Fresh mid-game face (Supabase already inserted the row)
           if (state.phase !== "lobby" && !existing.lateJoin) {
             markLateJoin(existing.id);
             if (!state.selectionsById) state.selectionsById = {};
@@ -1422,9 +1588,12 @@
           }
           return;
         }
+
         if (
           state.players.some(
-            (p) => p.name.toLowerCase() === String(action.player.name || "").trim().toLowerCase()
+            (p) =>
+              p.name.toLowerCase() ===
+              String(action.player.name || "").trim().toLowerCase()
           )
         ) {
           sync?.notifyJoinRejected?.({
@@ -1434,8 +1603,33 @@
           });
           return;
         }
-        const lateJoin = state.phase !== "lobby";
+
         const newId = action.player.id;
+        if (reclaim) {
+          const restored = {
+            id: newId,
+            name: String(action.player.name || reclaim.name || "").trim(),
+            answered: reclaim.answered ?? 0,
+            skips: reclaim.skips ?? 0,
+            selections: reclaim.selections ?? 0,
+            kicked: !!reclaim.kicked,
+            isHost: false,
+            lateJoin: !!reclaim.lateJoin,
+            joinedAt: reclaim.joinedAt || Date.now(),
+          };
+          state.players.push(restored);
+          if (!state.selectionsById) state.selectionsById = {};
+          state.selectionsById[newId] = restored.selections;
+          if (restored.lateJoin) markLateJoin(newId);
+          else if (state.lateJoinIds) {
+            state.lateJoinIds = state.lateJoinIds.filter((id) => id !== newId);
+          }
+          publish();
+          toast(`${restored.name} is back — progress restored`);
+          break;
+        }
+
+        const lateJoin = state.phase !== "lobby";
         state.players.push({
           id: newId,
           name: String(action.player.name || "").trim(),
@@ -2102,12 +2296,7 @@
     wheelSpinning = true;
     lastSpinToken = token;
 
-    const n = Math.max(players.length, 1);
-    const arc = (Math.PI * 2) / n;
-    // Pointer at top (-PI/2). Land slightly off-center inside the segment for realism.
-    const jitter = (spinUnit(token, 3) - 0.5) * arc * 0.55;
-    const targetCenter = targetIndex * arc + arc / 2 + jitter;
-    const desired = -Math.PI / 2 - targetCenter;
+    const desired = wheelAngleForIndex(players, targetIndex, token);
 
     // Extra full turns — synced across clients via spinToken
     const turns = 5 + Math.floor(spinUnit(token, 1) * 3); // 5–7
@@ -2712,23 +2901,34 @@
     }, 250);
   }
 
-  function hostKickPlayer(playerId, name) {
+  async function hostKickPlayer(playerId, name) {
     if (!me.isHost || !playerId || playerId === me.id) return;
-    if (!window.confirm(`Remove ${name || "this player"} from the room?`)) return;
+    const who = name || "this player";
+    const ok = await showConfirm({
+      eyebrow: "Host call",
+      title: `Boot ${who}?`,
+      message: "They’ll leave the room right away. The game keeps going without them.",
+      cancelLabel: "Keep them",
+      okLabel: "Remove",
+      danger: true,
+    });
+    if (!ok) return;
     send({ type: "kick", playerId, requestedBy: me.id });
   }
 
-  function hostSkipForCurrent() {
+  async function hostSkipForCurrent() {
     if (!me.isHost || !state?.currentPlayerId) return;
     const picked = getPlayer(state.currentPlayerId);
     if (!picked) return;
-    if (
-      !window.confirm(
-        `Skip this question for ${picked.name}? Counts as one of their skips.`
-      )
-    ) {
-      return;
-    }
+    const ok = await showConfirm({
+      eyebrow: "Host call",
+      title: `Skip for ${picked.name}?`,
+      message: "Counts as one of their skips, then the wheel moves on.",
+      cancelLabel: "Wait",
+      okLabel: "Skip it",
+      danger: true,
+    });
+    if (!ok) return;
     send({
       type: "skip",
       playerId: picked.id,
@@ -2747,8 +2947,9 @@
         const kick = document.createElement("button");
         kick.type = "button";
         kick.className = "btn-kick btn-kick-chip";
-        kick.textContent = "×";
-        kick.title = `Remove ${p.name}`;
+        kick.textContent = "Kick";
+        kick.title = `Kick ${p.name}`;
+        kick.setAttribute("aria-label", `Kick ${p.name}`);
         kick.onclick = (e) => {
           e.stopPropagation();
           hostKickPlayer(p.id, p.name);
@@ -2758,19 +2959,35 @@
       els.scoreStrip.appendChild(chip);
     });
 
-    if (!wheelSpinning) {
-      drawWheel(
-        alive,
-        wheelAngle,
-        state.phase === "answering" || state.phase === "confirm"
+    const highlightIdx =
+      state.phase === "answering" || state.phase === "confirm"
+        ? state.spinTargetIndex
+        : state.phase === "spinning"
           ? state.spinTargetIndex
-          : -1
-      );
-    }
+          : -1;
 
     if (state.phase === "spinning" && state.spinToken !== lastSpinToken) {
       els.wheelCaption.textContent = "The wheel decides…";
-      animateWheelToIndex(alive, state.spinTargetIndex, state.spinToken);
+      if (resumeSkipSpinAnim) {
+        // Refresh/resume mid-spin: land immediately, don’t replay 5s spin
+        resumeSkipSpinAnim = false;
+        snapWheelToTarget(alive);
+        drawWheel(alive, wheelAngle, state.spinTargetIndex);
+        paintGameWheel(alive, state.spinTargetIndex);
+      } else {
+        animateWheelToIndex(alive, state.spinTargetIndex, state.spinToken);
+      }
+    } else if (state.phase === "answering" || state.phase === "confirm") {
+      // Mid-turn refresh or phase flip during an in-flight spin
+      if (wheelSpinning || lastSpinToken !== (state.spinToken || 0)) {
+        snapWheelToTarget(alive);
+      }
+      resumeSkipSpinAnim = false;
+      drawWheel(alive, wheelAngle, highlightIdx);
+      paintGameWheel(alive, highlightIdx);
+    } else if (!wheelSpinning) {
+      drawWheel(alive, wheelAngle, -1);
+      paintGameWheel(alive, -1);
     }
 
     const picked = getPlayer(state.currentPlayerId);
@@ -3096,27 +3313,15 @@
       };
     }
     const newcomers = (players || []).filter((p) => !prevIds.has(p.id));
-    const midGame =
-      state.phase && state.phase !== "lobby" && state.phase !== "end";
-    // Host: flag + persist mid-game joiners (Supabase path adds them to players before join action)
-    if (me.isHost && midGame && newcomers.length) {
-      let marked = false;
+    // Host: keep roster synced. lateJoin vs reclaim is decided by the join action.
+    if (me.isHost && newcomers.length && state.phase !== "end") {
       newcomers.forEach((p) => {
-        if (p.isHost) return;
-        const already = lateJoinIdSet().has(p.id) || getPlayer(p.id)?.lateJoin;
-        markLateJoin(p.id);
         if (!state.selectionsById) state.selectionsById = {};
-        if (!(p.id in state.selectionsById)) state.selectionsById[p.id] = 0;
-        if (!already) {
-          const name = getPlayer(p.id)?.name || p.name;
-          toast(`${name} joined mid-game`);
-          marked = true;
-        } else {
-          marked = true;
+        if (!(p.id in state.selectionsById)) {
+          state.selectionsById[p.id] = getSelections(getPlayer(p.id) || p);
         }
       });
-      if (marked) publish();
-      else render();
+      publish();
     } else {
       render();
     }
@@ -3211,7 +3416,15 @@
     const cleanName = String(name || "").trim();
     if (!cleanName) throw new Error("Enter a name.");
 
-    // Block duplicate names before joining (except resuming as yourself)
+    const storedReclaim = !resumeId ? loadReclaim(code) : null;
+    const reclaimMatch = !!(
+      storedReclaim &&
+      storedReclaim.id &&
+      String(storedReclaim.name || "").toLowerCase() === cleanName.toLowerCase()
+    );
+    const reclaimPayload = reclaimMatch ? storedReclaim : null;
+
+    // Block duplicate names before joining (except resuming / reclaiming as yourself)
     if (!resumeId) {
       if (!preferLocal) {
         const { data: existing, error } = await db()
@@ -3219,9 +3432,12 @@
           .select("id, name")
           .eq("room_id", code);
         if (error) throw new Error(error.message);
+        const myReclaimId = reclaimPayload?.id;
         if (
           (existing || []).some(
-            (p) => p.name.toLowerCase() === cleanName.toLowerCase()
+            (p) =>
+              p.name.toLowerCase() === cleanName.toLowerCase() &&
+              p.id !== myReclaimId
           )
         ) {
           throw new Error(
@@ -3232,7 +3448,7 @@
     }
 
     me = {
-      id: resumeId || uid(),
+      id: resumeId || reclaimPayload?.id || uid(),
       name: cleanName,
       isHost: !!opts.resumeAsHost,
     };
@@ -3244,9 +3460,16 @@
     pendingReplacementId = null;
     ideaFilter = null;
     lastSpinToken = -1;
+    resumeSkipSpinAnim = !!resumeId || !!reclaimPayload;
     state = null;
 
     sync = preferLocal ? new LocalSync(code, me.isHost) : new SupabaseSync(code, me.isHost);
+
+    const joinMessage = (playerExtra = {}) => ({
+      type: "join",
+      player: { id: me.id, name: me.name, ...playerExtra },
+      reclaim: reclaimPayload,
+    });
 
     try {
       if (preferLocal) {
@@ -3273,11 +3496,11 @@
               );
               return;
             }
-            send({
-              type: "join",
-              player: { id: me.id, name: me.name },
-            });
-            if (st.phase !== "lobby") {
+            send(joinMessage());
+            if (reclaimPayload) {
+              clearReclaim(code);
+              toast("Welcome back — your progress is restored");
+            } else if (st.phase !== "lobby") {
               toast("Joined mid-game — you’ll play with the existing question pool");
             }
           }
@@ -3314,15 +3537,17 @@
         sync.isHost = me.isHost;
         if (!meRow && !reallyHost) {
           // Session thought we were host but we already left — join as guest
+          const snap = reclaimPayload || { answered: 0, skips: 0, selections: 0, kicked: false };
           await sync.addPlayer({
             id: me.id,
             name: me.name,
-            answered: 0,
-            skips: 0,
-            kicked: false,
+            answered: snap.answered ?? 0,
+            skips: snap.skips ?? 0,
+            kicked: !!snap.kicked,
             isHost: false,
           });
-          send({ type: "join", player: { id: me.id, name: me.name } });
+          send(joinMessage());
+          if (reclaimPayload) clearReclaim(code);
         }
         applyPlayers(await sync.fetchPlayers());
         restoreMyLocalQuestionsFromState();
@@ -3334,10 +3559,10 @@
         const joinPlayer = {
           id: me.id,
           name: me.name,
-          answered: 0,
-          skips: 0,
-          selections: 0,
-          kicked: false,
+          answered: reclaimPayload?.answered ?? 0,
+          skips: reclaimPayload?.skips ?? 0,
+          selections: reclaimPayload?.selections ?? 0,
+          kicked: !!reclaimPayload?.kicked,
           isHost: false,
         };
         await sync.start({ joinPlayer, resume: !!resumeId });
@@ -3351,17 +3576,17 @@
           me.isHost = !!meRow.isHost;
           sync.isHost = me.isHost;
         }
-        // Ensure host marks mid-game joiners (and local joiners) in shared state
+        // Ensure host marks mid-game joiners / restores reclaimers
         if (!resumeId) {
-          send({
-            type: "join",
-            player: { id: me.id, name: me.name },
-          });
+          send(joinMessage());
         }
         restoreMyLocalQuestionsFromState();
         if (me.isHost) recoverHostProgress();
         render();
-        if (!resumeId && state.phase !== "lobby") {
+        if (reclaimPayload) {
+          clearReclaim(code);
+          toast("Welcome back — your progress is restored");
+        } else if (!resumeId && state.phase !== "lobby") {
           toast("Joined mid-game — you’ll play with the existing question pool");
         }
       }
@@ -3435,6 +3660,8 @@
     const leavingId = me.id;
     const wasHost = me.isHost || state.hostId === leavingId;
     const leavingName = me.name;
+    // Same device can rejoin with this name and get progress back
+    const reclaimSnap = snapshotForReclaim(leavingId);
 
     try {
       if (wasHost) {
@@ -3464,7 +3691,10 @@
       console.error("Leave failed:", err);
     }
 
-    if (code) clearSession(code);
+    if (code) {
+      saveReclaim(code, { ...reclaimSnap, name: leavingName });
+      clearSession(code);
+    }
     try {
       sync?.destroy?.();
     } catch (_) {}
@@ -3472,6 +3702,9 @@
     state = null;
     me = { id: null, name: "", isHost: false };
     resetToHomeUi();
+    // Prefill name so same-device rejoin is one click
+    if (els.playerName && leavingName) els.playerName.value = leavingName;
+    if (els.roomCode && code) els.roomCode.value = code;
     toast(wasHost ? "You left — host passed on" : "You left the room");
   }
 
@@ -3635,7 +3868,10 @@
     }
   });
   els.btnPlayAgain.addEventListener("click", () => {
-    if (state?.roomCode) clearSession(state.roomCode);
+    if (state?.roomCode) {
+      clearSession(state.roomCode);
+      clearReclaim(state.roomCode);
+    }
     sync?.destroy?.();
     sync = null;
     state = null;
@@ -3645,11 +3881,18 @@
 
   async function onLeaveClick() {
     if (!state || !me?.id) return;
-    const msg =
-      me.isHost || state.hostId === me.id
-        ? "Leave and pass host to the next player?"
-        : "Leave this room?";
-    if (!window.confirm(msg)) return;
+    const isHostLeaving = me.isHost || state.hostId === me.id;
+    const ok = await showConfirm({
+      eyebrow: "Leaving?",
+      title: isHostLeaving ? "Pass the torch?" : "Heading out?",
+      message: isHostLeaving
+        ? "You’ll leave and the next player in line becomes host. The room keeps going."
+        : "You’ll leave this room. You can rejoin later with the code or link.",
+      cancelLabel: "Stay",
+      okLabel: isHostLeaving ? "Leave & pass host" : "Leave room",
+      danger: true,
+    });
+    if (!ok) return;
     if (els.btnLeaveRoom) els.btnLeaveRoom.disabled = true;
     if (els.btnLeaveLobby) els.btnLeaveLobby.disabled = true;
     try {
@@ -3663,14 +3906,31 @@
   els.btnLeaveRoom?.addEventListener("click", onLeaveClick);
   els.btnLeaveLobby?.addEventListener("click", onLeaveClick);
 
+  els.confirmCancel?.addEventListener("click", () => closeConfirm(false));
+  els.confirmOk?.addEventListener("click", () => closeConfirm(true));
+  els.confirmOverlay?.addEventListener("click", (e) => {
+    if (e.target === els.confirmOverlay) closeConfirm(false);
+  });
+  window.addEventListener("keydown", (e) => {
+    if (!els.confirmOverlay || els.confirmOverlay.hidden) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      closeConfirm(false);
+    }
+  });
+
   // Best-effort host handoff if the tab closes mid-game
   window.addEventListener("pagehide", () => {
     if (!state || !me?.id) return;
     if (!(me.isHost || state.hostId === me.id)) return;
     const next = nextHostCandidate(me.id);
     const code = state.roomCode;
+    const snap = snapshotForReclaim(me.id);
     if (!next) {
-      if (code) clearSession(code);
+      if (code) {
+        saveReclaim(code, snap);
+        clearSession(code);
+      }
       return;
     }
     try {
@@ -3686,7 +3946,10 @@
       });
       sync?.deletePlayer?.(me.id);
     } catch (_) {}
-    if (code) clearSession(code);
+    if (code) {
+      saveReclaim(code, snap);
+      clearSession(code);
+    }
   });
 
   // Prefill / invite-only home when opening an existing room link (?room=)

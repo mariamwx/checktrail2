@@ -252,6 +252,25 @@
       </div>
     </div>
 
+    <!-- CUTE CONFIRM (leave / kick / host-skip) -->
+    <div id="confirm-overlay" class="overlay confirm-overlay" hidden>
+      <div
+        class="overlay-card confirm-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-title"
+        aria-describedby="confirm-message"
+      >
+        <p class="confirm-eyebrow" id="confirm-eyebrow">Hold up</p>
+        <h2 id="confirm-title">Are you sure?</h2>
+        <p id="confirm-message" class="confirm-message"></p>
+        <div class="confirm-actions">
+          <button type="button" class="btn btn-ghost" id="confirm-cancel">Stay</button>
+          <button type="button" class="btn btn-danger" id="confirm-ok">Leave</button>
+        </div>
+      </div>
+    </div>
+
     <!-- HOST-ONLY: room code always visible top-right -->
     <div id="host-room-code" class="host-room-code" hidden>
       <span class="host-room-code-label">Room</span>
