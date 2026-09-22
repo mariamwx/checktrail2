@@ -1007,8 +1007,9 @@
             stage: wildcard.stage,
             confession: wildcard.confession || null,
             voterIds: Array.isArray(wildcard.voterIds) ? wildcard.voterIds : null,
-            // Never broadcast who voted which way — only a tally of ballots cast
-            votes: {},
+            // Keep ballots in authoritative state so host realtime echoes
+            // don't wipe the tally. UI never reveals who voted which way.
+            votes: wildcard.votes || {},
             votedCount: Object.keys(wildcard.votes || {}).length,
             result: wildcard.result || null,
             yesCount: wildcard.yesCount || 0,
@@ -2661,8 +2662,10 @@
         if (!state.wildcard.votes) state.wildcard.votes = {};
         // One vote per player; allow change until all cast
         state.wildcard.votes[voterId] = choice;
-        publish();
+        state.wildcard.votedCount = Object.keys(state.wildcard.votes).length;
+        // Resolve before publish so the result isn’t dropped behind an in-flight write
         maybeResolveWildcardVotes();
+        if (state.wildcard?.stage === "voting") publish();
         break;
       }
       default:
@@ -4309,6 +4312,7 @@
         yes.textContent = myVote === "yes" ? "✓ LET THEM BACK IN" : "LET THEM BACK IN";
         yes.onclick = () => {
           myWildcardVote = "yes";
+          render();
           send({ type: "wildcardVote", playerId: me.id, vote: "yes" });
         };
         const no = document.createElement("button");
@@ -4317,6 +4321,7 @@
         no.textContent = myVote === "no" ? "✓ KEEP THEM OUT" : "KEEP THEM OUT";
         no.onclick = () => {
           myWildcardVote = "no";
+          render();
           send({ type: "wildcardVote", playerId: me.id, vote: "no" });
         };
         row.appendChild(yes);
@@ -4571,6 +4576,28 @@
   }
 
   function applyGameState(st) {
+    // Host is authoritative — don't let our own room/broadcast echo clobber
+    // in-flight WILDCARD ballots (or any live host state mid-write).
+    if (me.isHost && sync?._writing) return;
+    if (
+      me.isHost &&
+      state?.phase === "wildcard" &&
+      state?.wildcard?.stage === "voting" &&
+      st?.wildcard?.stage === "voting"
+    ) {
+      const incoming = st.wildcard?.votes || {};
+      const local = state.wildcard?.votes || {};
+      // Prefer the richer tally (local may be ahead of a stale echo)
+      const mergedVotes = { ...incoming, ...local };
+      st = {
+        ...st,
+        wildcard: {
+          ...st.wildcard,
+          votes: mergedVotes,
+          votedCount: Object.keys(mergedVotes).length,
+        },
+      };
+    }
     const players = state?.players || st.players || [];
     state = mergeGameIntoState(st, players);
     syncHostRole();
