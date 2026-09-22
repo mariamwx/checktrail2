@@ -5,7 +5,10 @@ Required DOM ids / hooks. Renaming these breaks the game until `/public/logic` i
 ## Category 1 — `category1/index.html`
 
 ### Screens
-- `screen-home`, `screen-lobby`, `screen-questions`, `screen-game`, `screen-finals`, `screen-end`
+- `screen-home`, `screen-lobby`, `screen-questions`, `screen-game`, `screen-target`, `screen-wildcard`, `screen-finals`, `screen-end`
+
+### TARGET / WILDCARD stages
+- `target-stage`, `wildcard-stage`
 
 ### Home / lobby
 - `home-form`, `player-name`, `room-code`, `btn-create`, `btn-join`, `home-error`

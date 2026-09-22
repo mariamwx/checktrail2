@@ -43,6 +43,7 @@
     questions: $("#screen-questions"),
     game: $("#screen-game"),
     target: $("#screen-target"),
+    wildcard: $("#screen-wildcard"),
     finals: $("#screen-finals"),
     end: $("#screen-end"),
   };
@@ -104,6 +105,7 @@
     confirmCancel: $("#confirm-cancel"),
     confirmOk: $("#confirm-ok"),
     targetStage: $("#target-stage"),
+    wildcardStage: $("#wildcard-stage"),
   };
 
   // Editorial palette — matches iso-theme guy accents
@@ -135,6 +137,8 @@
   let revealCurtainPlayed = false;
   let myLocalQuestions = [];
   let toastTimer = null;
+  /** Local-only: own WILDCARD ballot (choices are never shown to others). */
+  let myWildcardVote = null;
 
   /** Circular idea reel for the question pool screen */
   const IDEA_BANK = [
@@ -326,6 +330,8 @@
       selections: getSelections(p) || 0,
       lateJoin: !!p?.lateJoin,
       kicked: !!p?.kicked,
+      wildcardEligible: !!p?.wildcardEligible,
+      wildcardUsed: !!p?.wildcardUsed,
       joinedAt: p?.joinedAt || Date.now(),
     };
   }
@@ -359,6 +365,11 @@
 
     if (state.phase === "answering") {
       armAnswerTimeout();
+    }
+
+    if (state.phase === "wildcard" && state.wildcard) {
+      recoverWildcardProgress();
+      return;
     }
 
     if (!isTargetPhase() || !state.target) return;
@@ -491,8 +502,7 @@
     player.skips += 1;
     // Question stays in the pool — someone else will face it
     if (player.skips >= MAX_SKIPS && canEliminatePlayer(player)) {
-      player.kicked = true;
-      toast(`${player.name} is out (3 skips)`);
+      markEliminatedBySkip(player);
     }
     logQuestionOutcome({ question: q, player, pot: "wheel", outcome: "skipped" });
     toast(`${player.name} ran out of time — skipped. Passing the question…`);
@@ -503,10 +513,7 @@
 
     if (shouldGoToFinals()) {
       state.currentQuestionId = null;
-      if (activePlayers().length <= 2) {
-        toast("Two players left — rapid fire!");
-      }
-      startFinals();
+      continueMode1Flow();
       return;
     }
 
@@ -518,15 +525,14 @@
     const alive = wheelPlayers().filter((p) => p.id !== excludeId);
     if (!alive.length || !q || q.used) {
       state.currentQuestionId = null;
-      if (shouldGoToFinals()) startFinals();
-      else beginWheelRound();
+      continueMode1Flow();
       return;
     }
 
     const player = pickFairWheelPlayer(alive);
     if (!player) {
       state.currentQuestionId = null;
-      beginWheelRound();
+      continueMode1Flow();
       return;
     }
     setSelections(player, getSelections(player) + 1);
@@ -781,6 +787,7 @@
 
   function hydratePlayerStats(players, st = state) {
     const map = st?.selectionsById || {};
+    const wcMap = st?.wildcardById || {};
     const prevById = Object.fromEntries((st?.players || []).map((p) => [p.id, p]));
     // Prefer the live room roster so lateJoin survives game-only broadcasts
     const liveById = Object.fromEntries((state?.players || []).map((p) => [p.id, p]));
@@ -792,6 +799,7 @@
         prev?.lateJoin ||
         lateIds.has(p.id)
       );
+      const wc = wcMap[p.id] || {};
       return {
         ...p,
         selections: map[p.id] ?? p.selections ?? 0,
@@ -800,6 +808,18 @@
         lateJoin,
         joinedAt: p.joinedAt ?? prev?.joinedAt ?? 0,
         isHost: !!(st?.hostId ? p.id === st.hostId : p.isHost || prev?.isHost),
+        wildcardEligible: !!(
+          wc.eligible ??
+          p.wildcardEligible ??
+          prev?.wildcardEligible ??
+          false
+        ),
+        wildcardUsed: !!(
+          wc.used ??
+          p.wildcardUsed ??
+          prev?.wildcardUsed ??
+          false
+        ),
       };
     });
   }
@@ -835,8 +855,14 @@
     if (st.selectionsById && playerId in st.selectionsById) {
       delete st.selectionsById[playerId];
     }
+    if (st.wildcardById && playerId in st.wildcardById) {
+      delete st.wildcardById[playerId];
+    }
     if (Array.isArray(st.lateJoinIds)) {
       st.lateJoinIds = st.lateJoinIds.filter((id) => id !== playerId);
+    }
+    if (Array.isArray(st.wildcardQueue)) {
+      st.wildcardQueue = st.wildcardQueue.filter((id) => id !== playerId);
     }
   }
 
@@ -891,8 +917,18 @@
         state.phase === "confirm") &&
       state.currentPlayerId === leftId
     ) {
-      if (shouldGoToFinals()) startFinals();
-      else beginWheelRound();
+      state.currentPlayerId = null;
+      state.currentQuestionId = null;
+      continueMode1Flow();
+      return;
+    }
+    if (isWildcardPhase()) {
+      if (abortWildcardForLeave(leftId)) {
+        continueMode1Flow();
+        return;
+      }
+      purgeWildcardVoter(leftId);
+      publish();
     }
   }
 
@@ -937,6 +973,9 @@
       lateJoinIds,
       finals,
       target,
+      wildcard,
+      wildcardQueue,
+      wildcardById,
       winnerId,
       revealForId,
       finalsAnswerScores,
@@ -962,6 +1001,22 @@
       lateJoinIds: Array.isArray(lateJoinIds) ? lateJoinIds : [],
       finals,
       target: target || null,
+      wildcard: wildcard
+        ? {
+            playerId: wildcard.playerId,
+            stage: wildcard.stage,
+            confession: wildcard.confession || null,
+            voterIds: Array.isArray(wildcard.voterIds) ? wildcard.voterIds : null,
+            // Never broadcast who voted which way — only a tally of ballots cast
+            votes: {},
+            votedCount: Object.keys(wildcard.votes || {}).length,
+            result: wildcard.result || null,
+            yesCount: wildcard.yesCount || 0,
+            noCount: wildcard.noCount || 0,
+          }
+        : null,
+      wildcardQueue: Array.isArray(wildcardQueue) ? wildcardQueue : [],
+      wildcardById: wildcardById || {},
       winnerId,
       revealForId,
       finalsAnswerScores: finalsAnswerScores || null,
@@ -1007,6 +1062,9 @@
       lateJoinIds: [],
       finals: null,
       target: null,
+      wildcard: null,
+      wildcardQueue: [],
+      wildcardById: {},
       winnerId: null,
       revealForId: null,
       finalsAnswerScores: null,
@@ -1605,7 +1663,10 @@
 
   // ---------- TARGET mode (mid-game special round) ----------
   function isTargetPhase(st = state) {
-    return st?.phase === "target_setup" || st?.phase === "target_active";
+    return (
+      !!st?.target &&
+      (st.phase === "target_setup" || st.phase === "target_active")
+    );
   }
 
   /** Chain length from participant count — single tunable entry point. */
@@ -1644,7 +1705,13 @@
 
   function canStartTarget() {
     if (!me.isHost || !state) return false;
-    if (isTargetPhase() || state.phase === "lobby" || state.phase === "finals" || state.phase === "end") {
+    if (
+      isTargetPhase() ||
+      isWildcardPhase() ||
+      state.phase === "lobby" ||
+      state.phase === "finals" ||
+      state.phase === "end"
+    ) {
       return false;
     }
     // During Mode 1 play (pool open or wheel)
@@ -1770,7 +1837,7 @@
 
   function breakTargetChain(player) {
     if (!state?.target || !player) return;
-    player.kicked = true;
+    markEliminatedBySkip(player, { toastOut: false });
     state.target.brokenById = player.id;
     state.target.brokenName = player.name;
     state.target.stage = "broken";
@@ -1818,11 +1885,275 @@
       publish();
       return;
     }
+    continueMode1Flow();
+  }
+
+  // ---------- WILDCARD (skip-out comeback vote) ----------
+  function isWildcardPhase(st = state) {
+    return st?.phase === "wildcard";
+  }
+
+  function getWildcardMeta(playerId, st = state) {
+    return (st?.wildcardById && st.wildcardById[playerId]) || {};
+  }
+
+  function setWildcardMeta(playerId, patch, st = state) {
+    if (!st || !playerId) return;
+    if (!st.wildcardById) st.wildcardById = {};
+    const prev = st.wildcardById[playerId] || {};
+    st.wildcardById[playerId] = {
+      eligible: !!(patch.eligible ?? prev.eligible),
+      used: !!(patch.used ?? prev.used),
+    };
+    const p = getPlayer(playerId, st);
+    if (p) {
+      p.wildcardEligible = st.wildcardById[playerId].eligible;
+      p.wildcardUsed = st.wildcardById[playerId].used;
+    }
+  }
+
+  function enqueueWildcard(playerId) {
+    if (!state || !playerId) return;
+    if (!Array.isArray(state.wildcardQueue)) state.wildcardQueue = [];
+    if (state.wildcardQueue.includes(playerId)) return;
+    state.wildcardQueue.push(playerId);
+  }
+
+  /**
+   * Mark a player out from a SKIP elimination and queue their one WILDCARD chance
+   * (unless they already used it).
+   */
+  function markEliminatedBySkip(player, { toastOut = true } = {}) {
+    if (!player) return;
+    player.kicked = true;
+    const meta = getWildcardMeta(player.id);
+    if (meta.used || player.wildcardUsed) {
+      setWildcardMeta(player.id, { eligible: false, used: true });
+      if (toastOut) toast(`${player.name} is permanently out`);
+      return;
+    }
+    setWildcardMeta(player.id, { eligible: true, used: false });
+    enqueueWildcard(player.id);
+    if (toastOut) toast(`${player.name} is out (3 skips)`);
+  }
+
+  /** Safe to interrupt Mode 1 between turns — never during TARGET / finals / pool. */
+  function canTriggerWildcardNow() {
+    if (!state || !me.isHost) return false;
+    if (isTargetPhase() || isWildcardPhase()) return false;
+    if (["lobby", "questions", "finals", "end"].includes(state.phase)) return false;
+    if (
+      (state.phase === "spinning" ||
+        state.phase === "answering" ||
+        state.phase === "confirm") &&
+      state.currentPlayerId
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  function peekNextWildcardCandidate() {
+    if (!state || !Array.isArray(state.wildcardQueue)) return null;
+    while (state.wildcardQueue.length) {
+      const id = state.wildcardQueue[0];
+      const p = getPlayer(id);
+      const meta = getWildcardMeta(id);
+      if (
+        p &&
+        p.kicked &&
+        (meta.eligible || p.wildcardEligible) &&
+        !(meta.used || p.wildcardUsed)
+      ) {
+        return id;
+      }
+      state.wildcardQueue.shift();
+    }
+    return null;
+  }
+
+  function tryStartNextWildcard() {
+    if (!canTriggerWildcardNow()) return false;
+    const playerId = peekNextWildcardCandidate();
+    if (!playerId) return false;
+    const voters = activePlayers().filter((p) => p.id !== playerId);
+    if (voters.length < 1) {
+      // Nobody left to vote — burn the chance and stay out
+      state.wildcardQueue.shift();
+      setWildcardMeta(playerId, { eligible: false, used: true });
+      const p = getPlayer(playerId);
+      if (p) p.kicked = true;
+      return false;
+    }
+    state.wildcardQueue.shift();
+    clearAnswerTimers();
+    state.wildcard = {
+      playerId,
+      stage: "intro",
+      confession: null,
+      voterIds: null, // frozen when voting opens
+      votes: {},
+      result: null,
+      yesCount: 0,
+      noCount: 0,
+    };
+    state.phase = "wildcard";
+    state.currentPlayerId = null;
+    state.currentQuestionId = null;
+    state.answerEndsAt = null;
+    myWildcardVote = null;
+    publish();
+    toast("WILDCARD");
+    return true;
+  }
+
+  /**
+   * After a Mode 1 turn (or TARGET) resolves: try WILDCARD queue, else finals/wheel.
+   */
+  function continueMode1Flow() {
+    if (!state) return;
+    if (activePlayers().length <= 0) {
+      state.phase = "end";
+      state.winnerId = null;
+      publish();
+      return;
+    }
+    if (activePlayers().length === 1) {
+      state.phase = "end";
+      state.winnerId = activePlayers()[0].id;
+      state.revealForId = pickAuthorRevealId();
+      publish();
+      return;
+    }
+    if (tryStartNextWildcard()) return;
     if (shouldGoToFinals()) {
+      if (activePlayers().length <= 2) {
+        toast("Two players left — rapid fire!");
+      }
       startFinals();
       return;
     }
     beginWheelRound();
+  }
+
+  let wildcardRevealTimer = null;
+  function clearWildcardRevealTimer() {
+    if (wildcardRevealTimer) {
+      clearTimeout(wildcardRevealTimer);
+      wildcardRevealTimer = null;
+    }
+  }
+
+  function openWildcardVoting() {
+    if (!state?.wildcard) return;
+    const pid = state.wildcard.playerId;
+    // Freeze the voting roster now (late joiners after this cannot vote)
+    state.wildcard.voterIds = activePlayers()
+      .filter((p) => p.id !== pid)
+      .map((p) => p.id);
+    state.wildcard.votes = {};
+    state.wildcard.stage = "voting";
+    publish();
+    maybeResolveWildcardVotes();
+  }
+
+  function maybeResolveWildcardVotes() {
+    if (!state?.wildcard || state.wildcard.stage !== "voting") return;
+    const voterIds = state.wildcard.voterIds || [];
+    const votes = state.wildcard.votes || {};
+    const cast = voterIds.filter((id) => votes[id] === "yes" || votes[id] === "no");
+    if (cast.length < voterIds.length) return;
+    resolveWildcardVotes();
+  }
+
+  function resolveWildcardVotes() {
+    if (!state?.wildcard) return;
+    const voterIds = state.wildcard.voterIds || [];
+    const votes = state.wildcard.votes || {};
+    let yes = 0;
+    let no = 0;
+    voterIds.forEach((id) => {
+      if (votes[id] === "yes") yes += 1;
+      else if (votes[id] === "no") no += 1;
+    });
+    state.wildcard.yesCount = yes;
+    state.wildcard.noCount = no;
+    // Majority only: YES must strictly exceed NO (ties stay out)
+    const success = yes > no;
+    state.wildcard.result = success ? "success" : "fail";
+    state.wildcard.stage = "result";
+    state.wildcard.votedCount = yes + no;
+
+    const player = getPlayer(state.wildcard.playerId);
+    setWildcardMeta(state.wildcard.playerId, { eligible: false, used: true });
+    if (player) {
+      if (success) {
+        player.kicked = false;
+        player.skips = 0;
+        toast(`${player.name} is back!`);
+      } else {
+        player.kicked = true;
+        toast(`${player.name} stays out`);
+      }
+    }
+    // Strip individual votes after tally (anonymity)
+    state.wildcard.votes = {};
+    myWildcardVote = null;
+    publish();
+    scheduleWildcardResume();
+  }
+
+  function scheduleWildcardResume() {
+    clearWildcardRevealTimer();
+    wildcardRevealTimer = setTimeout(() => {
+      wildcardRevealTimer = null;
+      if (!me.isHost || !state?.wildcard) return;
+      if (state.wildcard.stage !== "result") return;
+      endWildcardAndResumeMode1();
+    }, 2800);
+  }
+
+  function endWildcardAndResumeMode1() {
+    clearWildcardRevealTimer();
+    state.wildcard = null;
+    state.currentPlayerId = null;
+    state.currentQuestionId = null;
+    state.answerEndsAt = null;
+    myWildcardVote = null;
+    continueMode1Flow();
+  }
+
+  function recoverWildcardProgress() {
+    if (!me.isHost || !state?.wildcard) return;
+    const stage = state.wildcard.stage;
+    if (stage === "result") {
+      scheduleWildcardResume();
+    } else if (stage === "voting") {
+      maybeResolveWildcardVotes();
+    }
+  }
+
+  /** Candidate left / was removed mid-WILDCARD — burn the chance, stay out. */
+  function abortWildcardForLeave(playerId) {
+    if (!state?.wildcard || state.wildcard.playerId !== playerId) return false;
+    clearWildcardRevealTimer();
+    setWildcardMeta(playerId, { eligible: false, used: true });
+    state.wildcard = null;
+    return true;
+  }
+
+  /** Drop a leaver from the frozen voter list; re-check majority if voting. */
+  function purgeWildcardVoter(playerId) {
+    if (!state?.wildcard) return;
+    if (Array.isArray(state.wildcard.voterIds)) {
+      state.wildcard.voterIds = state.wildcard.voterIds.filter((id) => id !== playerId);
+    }
+    if (state.wildcard.votes && playerId in state.wildcard.votes) {
+      delete state.wildcard.votes[playerId];
+    }
+    if (state.wildcard.stage === "voting") {
+      maybeResolveWildcardVotes();
+    }
   }
 
   /**
@@ -1914,6 +2245,10 @@
             existing.lateJoin = !!reclaim.lateJoin;
             existing.joinedAt = reclaim.joinedAt || existing.joinedAt || Date.now();
             setSelections(existing, reclaim.selections ?? getSelections(existing));
+            setWildcardMeta(existing.id, {
+              eligible: !!reclaim.wildcardEligible,
+              used: !!reclaim.wildcardUsed,
+            });
             if (existing.lateJoin) markLateJoin(existing.id);
             else if (state.lateJoinIds) {
               state.lateJoinIds = state.lateJoinIds.filter((id) => id !== existing.id);
@@ -1962,10 +2297,16 @@
             isHost: false,
             lateJoin: !!reclaim.lateJoin,
             joinedAt: reclaim.joinedAt || Date.now(),
+            wildcardEligible: !!reclaim.wildcardEligible,
+            wildcardUsed: !!reclaim.wildcardUsed,
           };
           state.players.push(restored);
           if (!state.selectionsById) state.selectionsById = {};
           state.selectionsById[newId] = restored.selections;
+          setWildcardMeta(newId, {
+            eligible: restored.wildcardEligible,
+            used: restored.wildcardUsed,
+          });
           if (restored.lateJoin) markLateJoin(newId);
           else if (state.lateJoinIds) {
             state.lateJoinIds = state.lateJoinIds.filter((id) => id !== newId);
@@ -2111,8 +2452,7 @@
         // Consume this normal-phase question (does not move into rapid-fire reserve)
         q.used = true;
         if (player.skips >= MAX_SKIPS && canEliminatePlayer(player)) {
-          player.kicked = true;
-          toast(`${player.name} is out (3 skips)`);
+          markEliminatedBySkip(player);
         }
         logQuestionOutcome({ question: q, player, pot: "wheel", outcome: "skipped" });
         if (hostForce) {
@@ -2120,14 +2460,7 @@
         }
         state.currentPlayerId = null;
         state.currentQuestionId = null;
-        if (shouldGoToFinals()) {
-          if (activePlayers().length <= 2) {
-            toast("Two players left — rapid fire!");
-          }
-          startFinals();
-        } else {
-          beginWheelRound();
-        }
+        continueMode1Flow();
         break;
       }
       case "answerTimeout": {
@@ -2185,8 +2518,7 @@
         logQuestionOutcome({ question: q, player, pot: "wheel", outcome: "answered" });
         state.currentPlayerId = null;
         state.currentQuestionId = null;
-        if (shouldGoToFinals()) startFinals();
-        else beginWheelRound();
+        continueMode1Flow();
         break;
       }
       case "buzz": {
@@ -2290,6 +2622,47 @@
         const player = getPlayer(action.playerId);
         if (!player || player.kicked) return;
         breakTargetChain(player);
+        break;
+      }
+      case "wildcardBegin": {
+        if (!isWildcardPhase() || !state.wildcard) return;
+        if (state.wildcard.stage !== "intro") return;
+        state.wildcard.stage = "confession";
+        publish();
+        break;
+      }
+      case "wildcardConfess": {
+        if (!isWildcardPhase() || !state.wildcard) return;
+        if (state.wildcard.stage !== "confession") return;
+        if (action.playerId !== state.wildcard.playerId) return;
+        const text = String(action.text || "").trim();
+        if (!text) return;
+        state.wildcard.confession = text.slice(0, 280);
+        // Brief reveal beat, then open voting
+        state.wildcard.stage = "reveal";
+        publish();
+        clearWildcardRevealTimer();
+        wildcardRevealTimer = setTimeout(() => {
+          wildcardRevealTimer = null;
+          if (!me.isHost || !state?.wildcard) return;
+          if (state.wildcard.stage !== "reveal") return;
+          openWildcardVoting();
+        }, 1600);
+        break;
+      }
+      case "wildcardVote": {
+        if (!isWildcardPhase() || !state.wildcard) return;
+        if (state.wildcard.stage !== "voting") return;
+        const voterId = action.playerId;
+        if (!voterId || voterId === state.wildcard.playerId) return;
+        if (!(state.wildcard.voterIds || []).includes(voterId)) return;
+        const choice = action.vote === "yes" ? "yes" : action.vote === "no" ? "no" : null;
+        if (!choice) return;
+        if (!state.wildcard.votes) state.wildcard.votes = {};
+        // One vote per player; allow change until all cast
+        state.wildcard.votes[voterId] = choice;
+        publish();
+        maybeResolveWildcardVotes();
         break;
       }
       default:
@@ -2802,6 +3175,7 @@
         "finals",
         "target_setup",
         "target_active",
+        "wildcard",
       ].includes(state.phase);
     if (els.btnLeaveRoom) {
       els.btnLeaveRoom.hidden = !inRoom || state.phase === "lobby";
@@ -2822,7 +3196,15 @@
     answerDeadlineTick = null;
 
     const self = getPlayer(me.id);
-    els.kickedOverlay.hidden = !(self && self.kicked && state.phase !== "end" && state.phase !== "lobby");
+    const inOwnWildcard =
+      isWildcardPhase() && state.wildcard?.playerId === me.id;
+    els.kickedOverlay.hidden = !(
+      self &&
+      self.kicked &&
+      state.phase !== "end" &&
+      state.phase !== "lobby" &&
+      !inOwnWildcard
+    );
     updateHostRoomCode();
     updateLeaveButtons();
 
@@ -2845,6 +3227,10 @@
       case "target_active":
         showScreen("target");
         renderTarget();
+        break;
+      case "wildcard":
+        showScreen("wildcard");
+        renderWildcard();
         break;
       case "finals":
         showScreen("finals");
@@ -3813,6 +4199,156 @@
       lead.className = "lead";
       lead.textContent = `Waiting for ${targetPlayer?.name || "them"}…`;
       card.appendChild(lead);
+    }
+
+    root.appendChild(card);
+  }
+
+  function renderWildcard() {
+    const root = els.wildcardStage;
+    if (!root || !state?.wildcard) return;
+    const w = state.wildcard;
+    const subject = getPlayer(w.playerId);
+    const name = subject?.name || "Player";
+    const isSubject = me.id === w.playerId;
+    const self = getPlayer(me.id);
+
+    root.innerHTML = "";
+    const card = document.createElement("div");
+    card.className = "wildcard-card";
+
+    if (w.stage === "intro") {
+      card.innerHTML = `
+        <p class="eyebrow">Comeback chance</p>
+        <h2>WILDCARD</h2>
+        <p class="wildcard-nameplate">${escapeHtml(name)}</p>
+        <p class="lead">${escapeHtml(name)} has one chance to come back.<br/>They have something to confess.</p>
+      `;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn btn-primary btn-lg";
+      btn.textContent = "CONTINUE";
+      btn.onclick = () => send({ type: "wildcardBegin", playerId: me.id });
+      card.appendChild(btn);
+      root.appendChild(card);
+      return;
+    }
+
+    if (w.stage === "confession") {
+      if (isSubject) {
+        card.innerHTML = `
+          <p class="eyebrow">Your chance</p>
+          <h2>CONFESS SOMETHING</h2>
+          <p class="lead">Tell the players something they don’t know about you.</p>
+        `;
+        const form = document.createElement("form");
+        form.className = "wildcard-form";
+        form.innerHTML = `
+          <label>
+            <span>Confession</span>
+            <textarea id="wildcard-confession-input" maxlength="280" required placeholder="Something only you know…"></textarea>
+          </label>
+          <button type="submit" class="btn btn-primary btn-lg">SUBMIT CONFESSION</button>
+        `;
+        form.onsubmit = (e) => {
+          e.preventDefault();
+          const text = form.querySelector("#wildcard-confession-input")?.value || "";
+          send({ type: "wildcardConfess", playerId: me.id, text });
+        };
+        card.appendChild(form);
+      } else {
+        card.innerHTML = `
+          <p class="eyebrow">WILDCARD</p>
+          <h2>${escapeHtml(name)} is confessing…</h2>
+          <p class="lead">Waiting for their confession.</p>
+        `;
+      }
+      root.appendChild(card);
+      return;
+    }
+
+    if (w.stage === "reveal") {
+      card.innerHTML = `
+        <p class="eyebrow">${escapeHtml(name.toUpperCase())}’S CONFESSION</p>
+        <h2>WILDCARD</h2>
+        <p class="wildcard-confession">“${escapeHtml(w.confession || "")}”</p>
+        <p class="lead">Votes are coming up…</p>
+      `;
+      root.appendChild(card);
+      return;
+    }
+
+    if (w.stage === "voting") {
+      const voterIds = w.voterIds || [];
+      const castN =
+        typeof w.votedCount === "number"
+          ? w.votedCount
+          : Object.keys(w.votes || {}).length;
+      const totalN = voterIds.length;
+      const canVote = voterIds.includes(me.id) && !isSubject && self && !self.kicked;
+      const myVote = myWildcardVote || (w.votes || {})[me.id];
+
+      card.innerHTML = `
+        <p class="eyebrow">${escapeHtml(name.toUpperCase())}’S CONFESSION</p>
+        <h2>Should they return?</h2>
+        <p class="wildcard-confession">“${escapeHtml(w.confession || "")}”</p>
+        <p class="wildcard-progress">${castN} / ${totalN} votes in · anonymous</p>
+      `;
+
+      if (isSubject) {
+        const note = document.createElement("p");
+        note.className = "lead";
+        note.textContent = "You can’t vote on your own return. Waiting…";
+        card.appendChild(note);
+      } else if (canVote) {
+        const row = document.createElement("div");
+        row.className = "wildcard-vote-row";
+        const yes = document.createElement("button");
+        yes.type = "button";
+        yes.className = "btn btn-primary btn-lg";
+        yes.textContent = myVote === "yes" ? "✓ LET THEM BACK IN" : "LET THEM BACK IN";
+        yes.onclick = () => {
+          myWildcardVote = "yes";
+          send({ type: "wildcardVote", playerId: me.id, vote: "yes" });
+        };
+        const no = document.createElement("button");
+        no.type = "button";
+        no.className = "btn btn-danger btn-lg";
+        no.textContent = myVote === "no" ? "✓ KEEP THEM OUT" : "KEEP THEM OUT";
+        no.onclick = () => {
+          myWildcardVote = "no";
+          send({ type: "wildcardVote", playerId: me.id, vote: "no" });
+        };
+        row.appendChild(yes);
+        row.appendChild(no);
+        card.appendChild(row);
+        if (myVote) {
+          const note = document.createElement("p");
+          note.className = "lead";
+          note.textContent = "Vote locked in. Waiting on everyone else…";
+          card.appendChild(note);
+        }
+      } else {
+        const note = document.createElement("p");
+        note.className = "lead";
+        note.textContent = "You’re spectating this vote.";
+        card.appendChild(note);
+      }
+      root.appendChild(card);
+      return;
+    }
+
+    if (w.stage === "result") {
+      const success = w.result === "success";
+      card.classList.add(success ? "is-success" : "is-fail");
+      card.innerHTML = `
+        <p class="eyebrow">${success ? "WILDCARD SUCCESS" : "WILDCARD FAILED"}</p>
+        <h2>${success ? `${escapeHtml(name)} IS BACK.` : `${escapeHtml(name)} STAYS OUT.`}</h2>
+        <p class="wildcard-result-counts">YES ${w.yesCount ?? 0} · NO ${w.noCount ?? 0}</p>
+        <p class="lead">${success ? "Back in the game — one chance used." : "Permanently out of this game."}</p>
+      `;
+      root.appendChild(card);
+      return;
     }
 
     root.appendChild(card);
