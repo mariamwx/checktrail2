@@ -2005,7 +2005,7 @@
     myWildcardVote = null;
     state.wildcard = {
       playerId,
-      stage: "intro",
+      stage: "confession",
       confession: null,
       voterIds: null,
       votes: {},
@@ -2695,14 +2695,26 @@
         publish();
         break;
       }
+      case "wildcardConfess":
       case "wildcardConfessed": {
-        // Same shout-it-out beat as Mode 1 answers — no typed text
+        // Shout-it-out confirm (legacy alias: wildcardConfess)
         if (!isWildcardPhase() || !state.wildcard) return;
-        if (state.wildcard.stage !== "confession") return;
-        if (action.playerId !== state.wildcard.playerId) return;
+        if (
+          state.wildcard.stage !== "confession" &&
+          state.wildcard.stage !== "confess_sent"
+        ) {
+          return;
+        }
+        const subjectId = String(state.wildcard.playerId || "");
+        const actorId = String(action.playerId || "");
+        const requesterId = String(action.requestedBy || action.playerId || "");
+        const hostId = String(state.hostId || "");
+        // Subject confirms, or host advances if the confessor is stuck
+        const allowed = actorId === subjectId || requesterId === hostId;
+        if (!allowed) return;
         state.wildcard.confession = null;
-        state.wildcard.stage = "voting";
         openWildcardVoting();
+        toast("Votes are open");
         break;
       }
       case "wildcardVote": {
@@ -3271,15 +3283,20 @@
     answerDeadlineTick = null;
 
     const self = getPlayer(me.id);
-    const inOwnWildcard =
-      isWildcardPhase() && state.wildcard?.playerId === me.id;
+    // During WILDCARD everyone watches that screen — never trap anyone under the out overlay
+    const hideKickedForWildcard = isWildcardPhase();
     els.kickedOverlay.hidden = !(
       self &&
       self.kicked &&
       state.phase !== "end" &&
       state.phase !== "lobby" &&
-      !inOwnWildcard
+      !hideKickedForWildcard
     );
+    if (els.kickedOverlay) {
+      els.kickedOverlay.style.pointerEvents = hideKickedForWildcard
+        ? "none"
+        : "";
+    }
     updateWildcardEnterUi(self);
     updateHostRoomCode();
     updateLeaveButtons();
@@ -4303,26 +4320,56 @@
       return;
     }
 
-    if (w.stage === "confession") {
+    if (w.stage === "confession" || w.stage === "confess_sent") {
       if (isSubject) {
         card.innerHTML = `
           <p class="eyebrow">Your chance</p>
           <h2>CONFESS SOMETHING</h2>
           <p class="lead">Shout out something the others don’t know about you. When you’re done:</p>
         `;
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "btn btn-ok btn-lg";
-        btn.textContent = "Have you confessed? — Yes";
-        btn.onclick = () =>
-          send({ type: "wildcardConfessed", playerId: me.id });
-        card.appendChild(btn);
+        if (w.stage === "confess_sent") {
+          const note = document.createElement("p");
+          note.className = "lead";
+          note.textContent = "Sending… opening votes.";
+          card.appendChild(note);
+        } else {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "btn btn-ok btn-lg";
+          btn.textContent = "Have you confessed? — Yes";
+          btn.onclick = () => {
+            // Optimistic local feedback so a missed host ack isn’t silent
+            if (state?.wildcard) state.wildcard.stage = "confess_sent";
+            renderWildcard();
+            toast("Got it — opening votes…");
+            send({
+              type: "wildcardConfessed",
+              playerId: me.id,
+              requestedBy: me.id,
+            });
+          };
+          card.appendChild(btn);
+        }
       } else {
         card.innerHTML = `
           <p class="eyebrow">WILDCARD</p>
           <h2>${escapeHtml(name)} is confessing…</h2>
           <p class="lead">Listen up — they’ll shout it out loud.</p>
         `;
+        if (me.isHost) {
+          const hostBtn = document.createElement("button");
+          hostBtn.type = "button";
+          hostBtn.className = "btn btn-primary btn-lg";
+          hostBtn.style.marginTop = "0.75rem";
+          hostBtn.textContent = "They confessed — open voting";
+          hostBtn.onclick = () =>
+            send({
+              type: "wildcardConfessed",
+              playerId: w.playerId,
+              requestedBy: me.id,
+            });
+          card.appendChild(hostBtn);
+        }
       }
       root.appendChild(card);
       return;
