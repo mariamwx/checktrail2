@@ -139,6 +139,11 @@
   let toastTimer = null;
   /** Local-only: own WILDCARD ballot (choices are never shown to others). */
   let myWildcardVote = null;
+  /**
+   * Host-only ballot box. Survives publish/sync and is never written into
+   * the shared game blob as identifiable choices — only votedCount/result sync.
+   */
+  let hostWildcardVotes = {};
 
   /** Circular idea reel for the question pool screen */
   const IDEA_BANK = [
@@ -1007,10 +1012,12 @@
             stage: wildcard.stage,
             confession: wildcard.confession || null,
             voterIds: Array.isArray(wildcard.voterIds) ? wildcard.voterIds : null,
-            // Keep ballots in authoritative state so host realtime echoes
-            // don't wipe the tally. UI never reveals who voted which way.
-            votes: wildcard.votes || {},
-            votedCount: Object.keys(wildcard.votes || {}).length,
+            // Never sync individual ballots — host keeps those in hostWildcardVotes
+            votes: {},
+            votedCount:
+              typeof wildcard.votedCount === "number"
+                ? wildcard.votedCount
+                : Object.keys(hostWildcardVotes || {}).length,
             result: wildcard.result || null,
             yesCount: wildcard.yesCount || 0,
             noCount: wildcard.noCount || 0,
@@ -1271,6 +1278,9 @@
             filter: `code=eq.${this.code}`,
           },
           (payload) => {
+            // Host is authoritative — never re-apply our own room writes
+            // (stale echoes were rolling WILDCARD voting backwards).
+            if (this.isHost) return;
             const row = payload.new;
             if (!row) return;
             const game = row.game && typeof row.game === "object" ? row.game : {};
@@ -1289,7 +1299,7 @@
         )
         .on("broadcast", { event: "game" }, ({ payload }) => {
           // Fast path: spin / phase / questions land for every browser
-          if (!payload) return;
+          if (!payload || this.isHost) return;
           this.onState?.(
             mergeGameIntoState(payload, state?.players || [])
           );
@@ -1497,7 +1507,11 @@
 
     _handle(msg) {
       if (!msg || msg.sourceId === me.id) return;
-      if (msg.type === "state") this.onState?.(msg.state);
+      if (msg.type === "state") {
+        // Host is authoritative — ignore remote snapshots (same bug as Supabase echoes)
+        if (this.isHost) return;
+        this.onState?.(msg.state);
+      }
       if (msg.type === "action" && this.isHost) this.onAction?.(msg.action);
       if (msg.type === "hello" && this.isHost && state) {
         this.broadcastState(state);
@@ -2049,28 +2063,49 @@
     if (!state?.wildcard) return;
     const pid = state.wildcard.playerId;
     // Freeze the voting roster now (late joiners after this cannot vote)
-    state.wildcard.voterIds = activePlayers()
+    const roster = activePlayers()
       .filter((p) => p.id !== pid)
       .map((p) => p.id);
+    hostWildcardVotes = {};
+    myWildcardVote = null;
+    state.wildcard.voterIds = roster;
     state.wildcard.votes = {};
+    state.wildcard.votedCount = 0;
+    state.wildcard.result = null;
+    state.wildcard.yesCount = 0;
+    state.wildcard.noCount = 0;
     state.wildcard.stage = "voting";
     publish();
-    maybeResolveWildcardVotes();
+    // Nobody to vote → fail immediately
+    if (!roster.length) resolveWildcardVotes();
+  }
+
+  function wildcardVoterIds() {
+    if (!state?.wildcard) return [];
+    // Drop anyone who left the room so a ghost id can't stall the tally
+    return (state.wildcard.voterIds || []).filter((id) => !!getPlayer(id));
   }
 
   function maybeResolveWildcardVotes() {
     if (!state?.wildcard || state.wildcard.stage !== "voting") return;
-    const voterIds = state.wildcard.voterIds || [];
-    const votes = state.wildcard.votes || {};
+    const voterIds = wildcardVoterIds();
+    state.wildcard.voterIds = voterIds;
+    const votes = hostWildcardVotes || {};
     const cast = voterIds.filter((id) => votes[id] === "yes" || votes[id] === "no");
+    state.wildcard.votedCount = cast.length;
+    if (!voterIds.length) {
+      resolveWildcardVotes();
+      return;
+    }
     if (cast.length < voterIds.length) return;
     resolveWildcardVotes();
   }
 
   function resolveWildcardVotes() {
     if (!state?.wildcard) return;
-    const voterIds = state.wildcard.voterIds || [];
-    const votes = state.wildcard.votes || {};
+    if (state.wildcard.stage === "result") return;
+    const voterIds = wildcardVoterIds();
+    const votes = hostWildcardVotes || {};
     let yes = 0;
     let no = 0;
     voterIds.forEach((id) => {
@@ -2084,6 +2119,9 @@
     state.wildcard.result = success ? "success" : "fail";
     state.wildcard.stage = "result";
     state.wildcard.votedCount = yes + no;
+    state.wildcard.votes = {};
+    hostWildcardVotes = {};
+    myWildcardVote = null;
 
     const player = getPlayer(state.wildcard.playerId);
     setWildcardMeta(state.wildcard.playerId, { eligible: false, used: true });
@@ -2097,9 +2135,6 @@
         toast(`${player.name} stays out`);
       }
     }
-    // Strip individual votes after tally (anonymity)
-    state.wildcard.votes = {};
-    myWildcardVote = null;
     publish();
     scheduleWildcardResume();
   }
@@ -2121,6 +2156,7 @@
     state.currentQuestionId = null;
     state.answerEndsAt = null;
     myWildcardVote = null;
+    hostWildcardVotes = {};
     continueMode1Flow();
   }
 
@@ -2140,6 +2176,8 @@
     clearWildcardRevealTimer();
     setWildcardMeta(playerId, { eligible: false, used: true });
     state.wildcard = null;
+    hostWildcardVotes = {};
+    myWildcardVote = null;
     return true;
   }
 
@@ -2149,11 +2187,12 @@
     if (Array.isArray(state.wildcard.voterIds)) {
       state.wildcard.voterIds = state.wildcard.voterIds.filter((id) => id !== playerId);
     }
-    if (state.wildcard.votes && playerId in state.wildcard.votes) {
-      delete state.wildcard.votes[playerId];
+    if (hostWildcardVotes && playerId in hostWildcardVotes) {
+      delete hostWildcardVotes[playerId];
     }
     if (state.wildcard.stage === "voting") {
       maybeResolveWildcardVotes();
+      if (state.wildcard?.stage === "voting") publish();
     }
   }
 
@@ -2656,15 +2695,18 @@
         if (state.wildcard.stage !== "voting") return;
         const voterId = action.playerId;
         if (!voterId || voterId === state.wildcard.playerId) return;
-        if (!(state.wildcard.voterIds || []).includes(voterId)) return;
+        // Refresh roster (drop leavers) then accept ballot
+        const voterIds = wildcardVoterIds();
+        state.wildcard.voterIds = voterIds;
+        if (!voterIds.includes(voterId)) return;
         const choice = action.vote === "yes" ? "yes" : action.vote === "no" ? "no" : null;
         if (!choice) return;
-        if (!state.wildcard.votes) state.wildcard.votes = {};
-        // One vote per player; allow change until all cast
-        state.wildcard.votes[voterId] = choice;
-        state.wildcard.votedCount = Object.keys(state.wildcard.votes).length;
-        // Resolve before publish so the result isn’t dropped behind an in-flight write
+        hostWildcardVotes[voterId] = choice;
+        state.wildcard.votedCount = voterIds.filter(
+          (id) => hostWildcardVotes[id] === "yes" || hostWildcardVotes[id] === "no"
+        ).length;
         maybeResolveWildcardVotes();
+        // If still voting, sync the cast count; result path already published
         if (state.wildcard?.stage === "voting") publish();
         break;
       }
@@ -4576,28 +4618,6 @@
   }
 
   function applyGameState(st) {
-    // Host is authoritative — don't let our own room/broadcast echo clobber
-    // in-flight WILDCARD ballots (or any live host state mid-write).
-    if (me.isHost && sync?._writing) return;
-    if (
-      me.isHost &&
-      state?.phase === "wildcard" &&
-      state?.wildcard?.stage === "voting" &&
-      st?.wildcard?.stage === "voting"
-    ) {
-      const incoming = st.wildcard?.votes || {};
-      const local = state.wildcard?.votes || {};
-      // Prefer the richer tally (local may be ahead of a stale echo)
-      const mergedVotes = { ...incoming, ...local };
-      st = {
-        ...st,
-        wildcard: {
-          ...st.wildcard,
-          votes: mergedVotes,
-          votedCount: Object.keys(mergedVotes).length,
-        },
-      };
-    }
     const players = state?.players || st.players || [];
     state = mergeGameIntoState(st, players);
     syncHostRole();
