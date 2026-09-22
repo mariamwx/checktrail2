@@ -95,6 +95,9 @@
     standings: $("#standings"),
     btnPlayAgain: $("#btn-play-again"),
     kickedOverlay: $("#kicked-overlay"),
+    wildcardEnterWrap: $("#wildcard-enter-wrap"),
+    btnEnterWildcard: $("#btn-enter-wildcard"),
+    wildcardEnterHint: $("#wildcard-enter-hint"),
     toast: $("#toast"),
     btnLeaveRoom: $("#btn-leave-room"),
     btnLeaveLobby: $("#btn-leave-lobby"),
@@ -696,9 +699,13 @@
     restoreMyLocalQuestionsFromState();
     if (els.questionFeedback) {
       els.questionFeedback.hidden = false;
+      els.questionFeedback.classList.add("is-error");
       els.questionFeedback.textContent = msg;
       setTimeout(() => {
-        if (els.questionFeedback) els.questionFeedback.hidden = true;
+        if (els.questionFeedback) {
+          els.questionFeedback.hidden = true;
+          els.questionFeedback.classList.remove("is-error");
+        }
       }, 2200);
     }
     toast(msg);
@@ -1021,6 +1028,7 @@
             result: wildcard.result || null,
             yesCount: wildcard.yesCount || 0,
             noCount: wildcard.noCount || 0,
+            tied: !!wildcard.tied,
           }
         : null,
       wildcardQueue: Array.isArray(wildcardQueue) ? wildcardQueue : [],
@@ -1724,13 +1732,14 @@
       isTargetPhase() ||
       isWildcardPhase() ||
       state.phase === "lobby" ||
+      state.phase === "questions" ||
       state.phase === "finals" ||
       state.phase === "end"
     ) {
       return false;
     }
-    // During Mode 1 play (pool open or wheel)
-    if (!["questions", "spinning", "answering", "confirm"].includes(state.phase)) {
+    // Only during the wheel game — not while filling the question pool
+    if (!["spinning", "answering", "confirm"].includes(state.phase)) {
       return false;
     }
     return activePlayers().length >= TARGET_MIN_PLAYERS;
@@ -1927,16 +1936,9 @@
     }
   }
 
-  function enqueueWildcard(playerId) {
-    if (!state || !playerId) return;
-    if (!Array.isArray(state.wildcardQueue)) state.wildcardQueue = [];
-    if (state.wildcardQueue.includes(playerId)) return;
-    state.wildcardQueue.push(playerId);
-  }
-
   /**
-   * Mark a player out from a SKIP elimination and queue their one WILDCARD chance
-   * (unless they already used it).
+   * Mark a player out from a SKIP elimination and give them a WILDCARD button
+   * (unless they already used it). Does NOT auto-start WILDCARD.
    */
   function markEliminatedBySkip(player, { toastOut = true } = {}) {
     if (!player) return;
@@ -1948,66 +1950,66 @@
       return;
     }
     setWildcardMeta(player.id, { eligible: true, used: false });
-    enqueueWildcard(player.id);
-    if (toastOut) toast(`${player.name} is out (3 skips)`);
+    if (toastOut) toast(`${player.name} is out — WILDCARD available`);
   }
 
-  /** Safe to interrupt Mode 1 between turns — never during TARGET / finals / pool. */
-  function canTriggerWildcardNow() {
-    if (!state || !me.isHost) return false;
-    if (isTargetPhase() || isWildcardPhase()) return false;
-    if (["lobby", "questions", "finals", "end"].includes(state.phase)) return false;
-    if (
-      (state.phase === "spinning" ||
-        state.phase === "answering" ||
-        state.phase === "confirm") &&
-      state.currentPlayerId
-    ) {
-      return false;
+  function isWildcardEligible(playerId, st = state) {
+    const p = getPlayer(playerId, st);
+    if (!p || !p.kicked) return false;
+    const meta = getWildcardMeta(playerId, st);
+    if (meta.used || p.wildcardUsed) return false;
+    return !!(meta.eligible || p.wildcardEligible);
+  }
+
+  /**
+   * Client + host gate: player may fire WILDCARD now?
+   * Available anytime in Mode 1 except during TARGET / another WILDCARD / finals.
+   */
+  function wildcardRequestGate(playerId, st = state) {
+    if (!st || !playerId) return { ok: false, reason: "Not available." };
+    if (!isWildcardEligible(playerId, st)) {
+      return { ok: false, reason: "WILDCARD isn’t available for you." };
     }
-    return true;
-  }
-
-  function peekNextWildcardCandidate() {
-    if (!state || !Array.isArray(state.wildcardQueue)) return null;
-    while (state.wildcardQueue.length) {
-      const id = state.wildcardQueue[0];
-      const p = getPlayer(id);
-      const meta = getWildcardMeta(id);
-      if (
-        p &&
-        p.kicked &&
-        (meta.eligible || p.wildcardEligible) &&
-        !(meta.used || p.wildcardUsed)
-      ) {
-        return id;
+    if (isTargetPhase(st)) {
+      return { ok: false, reason: "TARGET is running — wait until it ends." };
+    }
+    if (isWildcardPhase(st)) {
+      if (st.wildcard?.playerId === playerId) {
+        return { ok: false, reason: "Your WILDCARD is already underway." };
       }
-      state.wildcardQueue.shift();
+      return { ok: false, reason: "Another WILDCARD is in progress — wait." };
     }
-    return null;
+    if (["lobby", "questions", "finals", "end"].includes(st.phase)) {
+      return { ok: false, reason: "WILDCARD isn’t available right now." };
+    }
+    const voters = activePlayers(st).filter((p) => p.id !== playerId);
+    if (voters.length < 1) {
+      return { ok: false, reason: "Nobody left to vote you back in." };
+    }
+    return { ok: true, reason: "One chance to shout a confession and ask to come back." };
   }
 
-  function tryStartNextWildcard() {
-    if (!canTriggerWildcardNow()) return false;
-    const playerId = peekNextWildcardCandidate();
-    if (!playerId) return false;
-    const voters = activePlayers().filter((p) => p.id !== playerId);
-    if (voters.length < 1) {
-      // Nobody left to vote — burn the chance and stay out
-      state.wildcardQueue.shift();
-      setWildcardMeta(playerId, { eligible: false, used: true });
-      const p = getPlayer(playerId);
-      if (p) p.kicked = true;
-      return false;
+  function startWildcardForPlayer(playerId) {
+    if (!state || !me.isHost) return false;
+    const gate = wildcardRequestGate(playerId);
+    if (!gate.ok) return false;
+
+    // Drop any stale queue entry for this player
+    if (Array.isArray(state.wildcardQueue)) {
+      state.wildcardQueue = state.wildcardQueue.filter((id) => id !== playerId);
     }
-    state.wildcardQueue.shift();
+
     clearAnswerTimers();
+    clearTargetRevealTimer();
+    hostWildcardVotes = {};
+    myWildcardVote = null;
     state.wildcard = {
       playerId,
       stage: "intro",
       confession: null,
-      voterIds: null, // frozen when voting opens
+      voterIds: null,
       votes: {},
+      votedCount: 0,
       result: null,
       yesCount: 0,
       noCount: 0,
@@ -2016,14 +2018,14 @@
     state.currentPlayerId = null;
     state.currentQuestionId = null;
     state.answerEndsAt = null;
-    myWildcardVote = null;
     publish();
     toast("WILDCARD");
     return true;
   }
 
   /**
-   * After a Mode 1 turn (or TARGET) resolves: try WILDCARD queue, else finals/wheel.
+   * After a Mode 1 turn (or TARGET / WILDCARD) resolves: finals or next wheel spin.
+   * WILDCARD only starts when an eligible player clicks Enter WILDCARD.
    */
   function continueMode1Flow() {
     if (!state) return;
@@ -2040,7 +2042,6 @@
       publish();
       return;
     }
-    if (tryStartNextWildcard()) return;
     if (shouldGoToFinals()) {
       if (activePlayers().length <= 2) {
         toast("Two players left — rapid fire!");
@@ -2072,6 +2073,7 @@
     state.wildcard.votes = {};
     state.wildcard.votedCount = 0;
     state.wildcard.result = null;
+    state.wildcard.tied = false;
     state.wildcard.yesCount = 0;
     state.wildcard.noCount = 0;
     state.wildcard.stage = "voting";
@@ -2114,8 +2116,10 @@
     });
     state.wildcard.yesCount = yes;
     state.wildcard.noCount = no;
-    // Majority only: YES must strictly exceed NO (ties stay out)
+    // Majority only: YES must strictly beat NO. A tie keeps them out.
+    const tied = yes === no;
     const success = yes > no;
+    state.wildcard.tied = tied;
     state.wildcard.result = success ? "success" : "fail";
     state.wildcard.stage = "result";
     state.wildcard.votedCount = yes + no;
@@ -2132,7 +2136,7 @@
         toast(`${player.name} is back!`);
       } else {
         player.kicked = true;
-        toast(`${player.name} stays out`);
+        toast(tied ? `${player.name} stays out (tie)` : `${player.name} stays out`);
       }
     }
     publish();
@@ -2610,7 +2614,8 @@
         break;
       }
       case "targetBegin": {
-        // Host or any participant can ack intro → setup (host authoritative)
+        // Host only — start question writing after the TARGET intro
+        if (action.playerId !== state.hostId) return;
         if (!state.target || state.phase !== "target_setup") return;
         if (state.target.stage !== "intro") return;
         state.target.stage = "setup";
@@ -2664,6 +2669,25 @@
         breakTargetChain(player);
         break;
       }
+      case "wildcardRequest": {
+        // Eliminated player opts in — never auto-starts on skip-out
+        const reqId = action.playerId;
+        if (!reqId) return;
+        if (action.requestedBy && action.requestedBy !== reqId) return;
+        const gate = wildcardRequestGate(reqId);
+        if (!gate.ok) {
+          if (reqId === me.id) toast(gate.reason);
+          else {
+            sync?.notifyQuestionRejected?.({
+              playerId: reqId,
+              message: gate.reason,
+            });
+          }
+          return;
+        }
+        startWildcardForPlayer(reqId);
+        break;
+      }
       case "wildcardBegin": {
         if (!isWildcardPhase() || !state.wildcard) return;
         if (state.wildcard.stage !== "intro") return;
@@ -2671,23 +2695,14 @@
         publish();
         break;
       }
-      case "wildcardConfess": {
+      case "wildcardConfessed": {
+        // Same shout-it-out beat as Mode 1 answers — no typed text
         if (!isWildcardPhase() || !state.wildcard) return;
         if (state.wildcard.stage !== "confession") return;
         if (action.playerId !== state.wildcard.playerId) return;
-        const text = String(action.text || "").trim();
-        if (!text) return;
-        state.wildcard.confession = text.slice(0, 280);
-        // Brief reveal beat, then open voting
-        state.wildcard.stage = "reveal";
-        publish();
-        clearWildcardRevealTimer();
-        wildcardRevealTimer = setTimeout(() => {
-          wildcardRevealTimer = null;
-          if (!me.isHost || !state?.wildcard) return;
-          if (state.wildcard.stage !== "reveal") return;
-          openWildcardVoting();
-        }, 1600);
+        state.wildcard.confession = null;
+        state.wildcard.stage = "voting";
+        openWildcardVoting();
         break;
       }
       case "wildcardVote": {
@@ -3230,6 +3245,21 @@
     }
   }
 
+  function updateWildcardEnterUi(self = getPlayer(me.id)) {
+    const wrap = els.wildcardEnterWrap;
+    const btn = els.btnEnterWildcard;
+    const hint = els.wildcardEnterHint;
+    if (!wrap || !btn) return;
+
+    const eligible = !!(self && isWildcardEligible(me.id));
+    wrap.hidden = !eligible;
+    if (!eligible) return;
+
+    const gate = wildcardRequestGate(me.id);
+    btn.disabled = !gate.ok;
+    if (hint) hint.textContent = gate.reason;
+  }
+
   function render() {
     if (!state) return;
 
@@ -3250,6 +3280,7 @@
       state.phase !== "lobby" &&
       !inOwnWildcard
     );
+    updateWildcardEnterUi(self);
     updateHostRoomCode();
     updateLeaveButtons();
 
@@ -3647,27 +3678,29 @@
     const sub = document.querySelector("#screen-questions .section-sub");
     if (title) title.textContent = late ? "You’re in" : "Question pool";
     if (sub) {
+      const left = Math.max(0, minQ - have);
       if (late) {
         sub.textContent =
           "You joined mid-game — hang tight. You’ll play with the questions already in the pool once the host starts.";
-      } else if (me.isHost) {
-        sub.textContent = ready
+      } else if (ready) {
+        sub.textContent = me.isHost
           ? "Pool ready! Keep adding until the timer ends, or start the game now."
-          : `One shared pot · at least ${minQ} questions (${nPlayers}×5) · ${formatTime(Math.max(0, remaining))} left to add more.`;
+          : "Pool ready. Keep adding questions — the host will start the game.";
       } else {
-        sub.textContent = ready
-          ? "Pool ready. Keep adding questions — the host will start the game."
-          : `Add questions to the pot · need ${minQ} total (${nPlayers}×5) · waiting on the host to start.`;
+        sub.textContent = me.isHost
+          ? `One shared pot · need ${left} more to reach ${minQ} (${nPlayers}×5) · ${formatTime(Math.max(0, remaining))} left.`
+          : `Add questions to the pot · need ${left} more to reach ${minQ} (${nPlayers}×5).`;
       }
     }
 
     const statusEl = document.getElementById("pool-status");
     if (statusEl) {
+      const left = Math.max(0, minQ - have);
       statusEl.textContent = late
         ? `Watching · ${have} questions in the pool`
         : ready
           ? `✓ Enough questions to start · ${have} / ${minQ}`
-          : `${have} / ${minQ} minimum questions`;
+          : `${have} / ${minQ} · need ${left} more`;
       statusEl.classList.toggle("pool-ready", ready && !late);
     }
 
@@ -3723,25 +3756,9 @@
 
     ensureIdeasPanel();
 
-    // Host can launch TARGET once the pool is live / locked
-    let targetBtn = document.getElementById("btn-start-target-q");
-    if (canStartTarget()) {
-      if (!targetBtn && els.questionForm?.parentElement) {
-        targetBtn = document.createElement("button");
-        targetBtn.type = "button";
-        targetBtn.id = "btn-start-target-q";
-        targetBtn.className = "btn btn-ghost";
-        targetBtn.style.marginTop = "0.5rem";
-        els.questionForm.parentElement.appendChild(targetBtn);
-      }
-      if (targetBtn) {
-        targetBtn.hidden = false;
-        targetBtn.textContent = "Start TARGET round";
-        targetBtn.onclick = () => send({ type: "startTarget", playerId: me.id });
-      }
-    } else if (targetBtn) {
-      targetBtn.hidden = true;
-    }
+    // TARGET is wheel-only — never offer it on the question pool screen
+    const targetBtnQ = document.getElementById("btn-start-target-q");
+    if (targetBtnQ) targetBtnQ.hidden = true;
 
     // Host can remove players during the question pool
     let hostKickList = document.getElementById("host-kick-list");
@@ -4050,12 +4067,19 @@
         <p class="lead">Everyone writes one anonymous question and chooses one person. Nobody knows who chose them.</p>
         <p class="target-progress">${totalN} players in · ${targetChainLength(totalN)} questions will be played</p>
       `;
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "btn btn-primary btn-lg";
-      btn.textContent = "BEGIN";
-      btn.onclick = () => send({ type: "targetBegin", playerId: me.id });
-      card.appendChild(btn);
+      if (me.isHost) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn btn-primary btn-lg";
+        btn.textContent = "BEGIN";
+        btn.onclick = () => send({ type: "targetBegin", playerId: me.id });
+        card.appendChild(btn);
+      } else {
+        const note = document.createElement("p");
+        note.className = "lead";
+        note.textContent = "Waiting for the host to begin…";
+        card.appendChild(note);
+      }
       root.appendChild(card);
       return;
     }
@@ -4267,7 +4291,7 @@
         <p class="eyebrow">Comeback chance</p>
         <h2>WILDCARD</h2>
         <p class="wildcard-nameplate">${escapeHtml(name)}</p>
-        <p class="lead">${escapeHtml(name)} has one chance to come back.<br/>They have something to confess.</p>
+        <p class="lead">${escapeHtml(name)} has one chance to come back.<br/>They’ll shout a confession — then everyone else votes.</p>
       `;
       const btn = document.createElement("button");
       btn.type = "button";
@@ -4284,41 +4308,22 @@
         card.innerHTML = `
           <p class="eyebrow">Your chance</p>
           <h2>CONFESS SOMETHING</h2>
-          <p class="lead">Tell the players something they don’t know about you.</p>
+          <p class="lead">Shout out something the others don’t know about you. When you’re done:</p>
         `;
-        const form = document.createElement("form");
-        form.className = "wildcard-form";
-        form.innerHTML = `
-          <label>
-            <span>Confession</span>
-            <textarea id="wildcard-confession-input" maxlength="280" required placeholder="Something only you know…"></textarea>
-          </label>
-          <button type="submit" class="btn btn-primary btn-lg">SUBMIT CONFESSION</button>
-        `;
-        form.onsubmit = (e) => {
-          e.preventDefault();
-          const text = form.querySelector("#wildcard-confession-input")?.value || "";
-          send({ type: "wildcardConfess", playerId: me.id, text });
-        };
-        card.appendChild(form);
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "btn btn-ok btn-lg";
+        btn.textContent = "Have you confessed? — Yes";
+        btn.onclick = () =>
+          send({ type: "wildcardConfessed", playerId: me.id });
+        card.appendChild(btn);
       } else {
         card.innerHTML = `
           <p class="eyebrow">WILDCARD</p>
           <h2>${escapeHtml(name)} is confessing…</h2>
-          <p class="lead">Waiting for their confession.</p>
+          <p class="lead">Listen up — they’ll shout it out loud.</p>
         `;
       }
-      root.appendChild(card);
-      return;
-    }
-
-    if (w.stage === "reveal") {
-      card.innerHTML = `
-        <p class="eyebrow">${escapeHtml(name.toUpperCase())}’S CONFESSION</p>
-        <h2>WILDCARD</h2>
-        <p class="wildcard-confession">“${escapeHtml(w.confession || "")}”</p>
-        <p class="lead">Votes are coming up…</p>
-      `;
       root.appendChild(card);
       return;
     }
@@ -4334,9 +4339,9 @@
       const myVote = myWildcardVote || (w.votes || {})[me.id];
 
       card.innerHTML = `
-        <p class="eyebrow">${escapeHtml(name.toUpperCase())}’S CONFESSION</p>
-        <h2>Should they return?</h2>
-        <p class="wildcard-confession">“${escapeHtml(w.confession || "")}”</p>
+        <p class="eyebrow">Anonymous vote</p>
+        <h2>Should ${escapeHtml(name)} return?</h2>
+        <p class="lead">${escapeHtml(name)} just confessed out loud. Majority yes brings them back — a tie keeps them out.</p>
         <p class="wildcard-progress">${castN} / ${totalN} votes in · anonymous</p>
       `;
 
@@ -4387,12 +4392,16 @@
 
     if (w.stage === "result") {
       const success = w.result === "success";
+      const tied = !!w.tied || (!success && (w.yesCount ?? 0) === (w.noCount ?? 0));
       card.classList.add(success ? "is-success" : "is-fail");
+      const failLead = tied
+        ? "Tie vote — not a majority. Permanently out of this game."
+        : "Permanently out of this game.";
       card.innerHTML = `
-        <p class="eyebrow">${success ? "WILDCARD SUCCESS" : "WILDCARD FAILED"}</p>
+        <p class="eyebrow">${success ? "WILDCARD SUCCESS" : tied ? "WILDCARD TIE" : "WILDCARD FAILED"}</p>
         <h2>${success ? `${escapeHtml(name)} IS BACK.` : `${escapeHtml(name)} STAYS OUT.`}</h2>
         <p class="wildcard-result-counts">YES ${w.yesCount ?? 0} · NO ${w.noCount ?? 0}</p>
-        <p class="lead">${success ? "Back in the game — one chance used." : "Permanently out of this game."}</p>
+        <p class="lead">${success ? "Back in the game — one chance used." : failLead}</p>
       `;
       root.appendChild(card);
       return;
@@ -5105,12 +5114,29 @@
     e.preventDefault();
     if (!canSubmitQuestions()) return;
     const text = els.questionInput.value.trim();
-    if (!text) return;
+    if (!text) {
+      if (els.questionFeedback) {
+        els.questionFeedback.hidden = false;
+        els.questionFeedback.classList.add("is-error");
+        els.questionFeedback.textContent = "Type a question in the box first.";
+        setTimeout(() => {
+          if (els.questionFeedback) {
+            els.questionFeedback.hidden = true;
+            els.questionFeedback.classList.remove("is-error");
+          }
+        }, 2200);
+      }
+      toast("Type a question in the box first.");
+      els.questionInput?.focus();
+      return;
+    }
     if (questionAlreadyInPool(text)) {
       els.questionFeedback.hidden = false;
+      els.questionFeedback.classList.add("is-error");
       els.questionFeedback.textContent = "That question is already in the pool.";
       setTimeout(() => {
         els.questionFeedback.hidden = true;
+        els.questionFeedback.classList.remove("is-error");
       }, 2200);
       toast("That question is already in the pool.");
       return;
@@ -5125,6 +5151,7 @@
     send({ type: "addQuestion", playerId: me.id, text });
     els.questionInput.value = "";
     els.questionFeedback.hidden = false;
+    els.questionFeedback.classList.remove("is-error");
     els.questionFeedback.textContent = "Added to the pot.";
     setTimeout(() => {
       els.questionFeedback.hidden = true;
@@ -5208,6 +5235,16 @@
 
   els.btnLeaveRoom?.addEventListener("click", onLeaveClick);
   els.btnLeaveLobby?.addEventListener("click", onLeaveClick);
+
+  els.btnEnterWildcard?.addEventListener("click", () => {
+    if (!me?.id || !state) return;
+    const gate = wildcardRequestGate(me.id);
+    if (!gate.ok) {
+      toast(gate.reason);
+      return;
+    }
+    send({ type: "wildcardRequest", playerId: me.id, requestedBy: me.id });
+  });
 
   els.confirmCancel?.addEventListener("click", () => closeConfirm(false));
   els.confirmOk?.addEventListener("click", () => closeConfirm(true));

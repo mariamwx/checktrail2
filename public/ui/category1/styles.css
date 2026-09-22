@@ -546,6 +546,29 @@ textarea {
   max-width: 520px;
 }
 
+.feedback {
+  margin: 0.65rem 0 0;
+  max-width: 520px;
+  padding: 0.65rem 0.85rem;
+  border: 2.5px solid var(--line);
+  border-radius: 2px;
+  background: #fff;
+  color: var(--text);
+  font-size: 0.92rem;
+  line-height: 1.35;
+  font-weight: 600;
+}
+
+.feedback.is-error {
+  border-color: var(--coral);
+  color: var(--coral);
+  background: #fdf6f4;
+}
+
+.feedback[hidden] {
+  display: none !important;
+}
+
 /* ===== Ideas reel (date-picker cylinder) ===== */
 .ideas-panel {
   background: #fff;
@@ -1498,6 +1521,28 @@ textarea {
   letter-spacing: 0.02em;
   margin: 0 0 0.65rem;
   color: var(--text);
+}
+
+.wildcard-enter-wrap {
+  margin-top: 1.15rem;
+  display: grid;
+  gap: 0.55rem;
+}
+
+.wildcard-enter-wrap[hidden] {
+  display: none !important;
+}
+
+.wildcard-enter-wrap .btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.wildcard-enter-hint {
+  margin: 0;
+  font-size: 0.88rem;
+  color: var(--muted);
+  line-height: 1.35;
 }
 
 .confirm-overlay {

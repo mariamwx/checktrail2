@@ -111,8 +111,8 @@
           <h2 class="section-title">Question pool</h2>
           <p class="section-sub">One shared pot. Minimum = players × 5. You have 3 minutes to add as many as you want.</p>
 
-          <form id="question-form" class="question-form">
-            <textarea id="question-input" rows="3" maxlength="200" placeholder="Add a question…" required></textarea>
+          <form id="question-form" class="question-form" novalidate>
+            <textarea id="question-input" rows="3" maxlength="200" placeholder="Add a question…"></textarea>
             <button type="submit" class="btn btn-primary">Add question</button>
           </form>
           <p id="question-feedback" class="feedback" hidden></p>
@@ -271,6 +271,14 @@
         <h2>You’re out</h2>
         <p>Three skips. The wheel moves on without you.</p>
         <p class="hint">You can still watch — you just can’t be picked again.</p>
+        <div id="wildcard-enter-wrap" class="wildcard-enter-wrap" hidden>
+          <button type="button" class="btn btn-primary btn-lg" id="btn-enter-wildcard">
+            Enter WILDCARD
+          </button>
+          <p class="wildcard-enter-hint" id="wildcard-enter-hint">
+            One chance to shout a confession and ask to come back.
+          </p>
+        </div>
       </div>
     </div>
 
