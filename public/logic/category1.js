@@ -11,7 +11,7 @@
   "use strict";
 
   const QUESTION_SECONDS = 3 * 60;
-  const FINALS_SECONDS = 45;
+  const ANSWER_SECONDS = 60;
   const BUZZ_REVEAL_MS = 1200;
   const MAX_SKIPS = 3;
 
@@ -46,7 +46,10 @@
     btnJoin: $("#btn-join"),
     homeError: $("#home-error"),
     lobbyCode: $("#lobby-code"),
+    lobbyRoomChip: $("#lobby-room-chip"),
     btnCopyLink: $("#btn-copy-link"),
+    hostRoomCode: $("#host-room-code"),
+    hostRoomCodeValue: $("#host-room-code-value"),
     playerList: $("#player-list"),
     lobbyStatus: $("#lobby-status"),
     btnStartQuestions: $("#btn-start-questions"),
@@ -83,6 +86,8 @@
     btnPlayAgain: $("#btn-play-again"),
     kickedOverlay: $("#kicked-overlay"),
     toast: $("#toast"),
+    btnLeaveRoom: $("#btn-leave-room"),
+    btnLeaveLobby: $("#btn-leave-lobby"),
   };
 
   // Editorial palette — matches iso-theme guy accents
@@ -102,6 +107,8 @@
   let me = { id: null, name: "", isHost: false };
   let sync = null;
   let questionTick = null;
+  let answerDeadlineTick = null;
+  let answerTimeoutTimer = null;
   let finalsTick = null;
   let wheelAngle = 0;
   let wheelSpinning = false;
@@ -284,10 +291,129 @@
         if (state.phase !== "spinning") return;
         if (state.spinToken !== token) return;
         if (state.currentPlayerId !== playerId) return;
-        state.phase = "answering";
-        publish();
+        openAnsweringPhase({ freshDeadline: !state.answerEndsAt });
       }, Math.min(SPIN_MS, 1600) + 200);
     }
+
+    if (state.phase === "answering") {
+      armAnswerTimeout();
+    }
+  }
+
+  function clearAnswerTimers() {
+    if (answerTimeoutTimer) {
+      clearTimeout(answerTimeoutTimer);
+      answerTimeoutTimer = null;
+    }
+    if (answerDeadlineTick) {
+      clearInterval(answerDeadlineTick);
+      answerDeadlineTick = null;
+    }
+  }
+
+  /** Move spinning → answering and start the 60s respond clock (host). */
+  function openAnsweringPhase({ freshDeadline = true } = {}) {
+    if (!state) return;
+    state.phase = "answering";
+    if (freshDeadline || !state.answerEndsAt) {
+      state.answerEndsAt = Date.now() + ANSWER_SECONDS * 1000;
+    }
+    publish();
+    armAnswerTimeout();
+  }
+
+  /** Host-only: fire answerTimeout when the respond window ends. */
+  function armAnswerTimeout() {
+    clearTimeout(answerTimeoutTimer);
+    answerTimeoutTimer = null;
+    if (!me.isHost || !state || state.phase !== "answering") return;
+    if (!state.answerEndsAt) {
+      state.answerEndsAt = Date.now() + ANSWER_SECONDS * 1000;
+    }
+    const delay = Math.max(0, state.answerEndsAt - Date.now());
+    answerTimeoutTimer = setTimeout(() => {
+      answerTimeoutTimer = null;
+      if (!me.isHost || !state || state.phase !== "answering") return;
+      handleAction({ type: "answerTimeout" });
+    }, delay + 40);
+  }
+
+  /**
+   * Timed-out player gets a skip; the same question is spun to someone else.
+   */
+  function passQuestionOnTimeout() {
+    const player = getPlayer(state.currentPlayerId);
+    const q = state.questions.find((x) => x.id === state.currentQuestionId);
+    if (!player || !q) return;
+
+    clearAnswerTimers();
+    state.answerEndsAt = null;
+
+    player.skips += 1;
+    // Question stays in the pool — someone else will face it
+    if (player.skips >= MAX_SKIPS && canEliminatePlayer(player)) {
+      player.kicked = true;
+      toast(`${player.name} is out (3 skips)`);
+    }
+    logQuestionOutcome({ question: q, player, pot: "wheel", outcome: "skipped" });
+    toast(`${player.name} ran out of time — skipped. Passing the question…`);
+
+    const timedOutId = player.id;
+    state.currentPlayerId = null;
+    // keep currentQuestionId for reassign
+
+    if (shouldGoToFinals()) {
+      state.currentQuestionId = null;
+      if (activePlayers().length <= 2) {
+        toast("Two players left — rapid fire!");
+      }
+      startFinals();
+      return;
+    }
+
+    reassignSameQuestion(q, timedOutId);
+  }
+
+  /** Wheel a different active player onto the same unanswered question. */
+  function reassignSameQuestion(q, excludeId) {
+    const alive = wheelPlayers().filter((p) => p.id !== excludeId);
+    if (!alive.length || !q || q.used) {
+      state.currentQuestionId = null;
+      if (shouldGoToFinals()) startFinals();
+      else beginWheelRound();
+      return;
+    }
+
+    const player = pickFairWheelPlayer(alive);
+    if (!player) {
+      state.currentQuestionId = null;
+      beginWheelRound();
+      return;
+    }
+    setSelections(player, getSelections(player) + 1);
+
+    const allAlive = wheelPlayers();
+    const targetIndex = Math.max(
+      0,
+      allAlive.findIndex((p) => p.id === player.id)
+    );
+
+    state.phase = "spinning";
+    state.spinTargetIndex = targetIndex;
+    state.spinToken += 1;
+    state.currentPlayerId = player.id;
+    state.currentQuestionId = q.id;
+    state.answerEndsAt = null;
+    publish();
+
+    const token = state.spinToken;
+    const playerId = player.id;
+    setTimeout(() => {
+      if (!state || state.phase !== "spinning") return;
+      if (state.spinToken !== token) return;
+      if (state.currentPlayerId !== playerId) return;
+      openAnsweringPhase({ freshDeadline: true });
+    }, SPIN_MS + 180);
   }
 
   // ---------- utils ----------
@@ -338,9 +464,40 @@
     if (code) clearSession(code);
     setHomeError(msg);
     showScreen("home");
+    updateHostRoomCode();
     if (code && typeof enableInviteHome === "function") enableInviteHome(code);
     toast(msg);
     if (els.btnJoin) els.btnJoin.disabled = false;
+  }
+
+  function handleKickedOut(message) {
+    const msg = message || "The host removed you from the room.";
+    const code = sync?.code || state?.roomCode;
+    try {
+      sync?.destroy?.();
+    } catch (_) {}
+    sync = null;
+    state = null;
+    me = { id: null, name: "", isHost: false };
+    if (code) clearSession(code);
+    resetToHomeUi();
+    setHomeError(msg);
+    toast(msg);
+  }
+
+  function handleQuestionRejected(message) {
+    const msg = message || "That question is already in the pool.";
+    // Drop the ghost local copy — pool is source of truth
+    restoreMyLocalQuestionsFromState();
+    if (els.questionFeedback) {
+      els.questionFeedback.hidden = false;
+      els.questionFeedback.textContent = msg;
+      setTimeout(() => {
+        if (els.questionFeedback) els.questionFeedback.hidden = true;
+      }, 2200);
+    }
+    toast(msg);
+    if (state?.phase === "questions") renderQuestions();
   }
 
   function formatTime(totalSec) {
@@ -354,12 +511,41 @@
     return (st?.players || []).filter((p) => !p.kicked);
   }
 
+  /** Players who were in for question-writing (excludes mid-game joiners). */
+  function poolPlayers(st = state) {
+    return activePlayers(st).filter((p) => !p.lateJoin);
+  }
+
+  function canSubmitQuestions(playerId = me.id, st = state) {
+    if (!st || st.phase !== "questions" || st.questionsLocked) return false;
+    const p = getPlayer(playerId, st);
+    return !!(p && !p.kicked && !p.lateJoin);
+  }
+
   function minimumQuestionsRequired(st = state) {
-    return Math.max(2, activePlayers(st).length) * 5;
+    if (st?.poolMinQuestions) return st.poolMinQuestions;
+    return Math.max(2, poolPlayers(st).length || activePlayers(st).length) * 5;
   }
 
   function poolReady(st = state) {
     return (st?.questions || []).length >= minimumQuestionsRequired(st);
+  }
+
+  /** Collapse casing / spacing / trailing ?!. so “Same Q?” matches “same q”. */
+  function normalizeQuestionKey(text) {
+    return String(text || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[?!.,;:]+$/g, "")
+      .replace(/\s+/g, " ");
+  }
+
+  function questionAlreadyInPool(text, st = state) {
+    const key = normalizeQuestionKey(text);
+    if (!key) return false;
+    return (st?.questions || []).some(
+      (q) => normalizeQuestionKey(q.text) === key
+    );
   }
 
   /** Normal-phase questions still remaining */
@@ -387,18 +573,133 @@
     state.selectionsById[player.id] = value;
   }
 
+  function lateJoinIdSet(st = state) {
+    return new Set(st?.lateJoinIds || []);
+  }
+
+  function markLateJoin(playerId, st = state) {
+    if (!st || !playerId) return;
+    if (!st.lateJoinIds) st.lateJoinIds = [];
+    if (!st.lateJoinIds.includes(playerId)) st.lateJoinIds.push(playerId);
+    const p = getPlayer(playerId, st);
+    if (p) p.lateJoin = true;
+  }
+
   function hydratePlayerStats(players, st = state) {
     const map = st?.selectionsById || {};
-    return (players || []).map((p) => ({
-      ...p,
-      selections: map[p.id] ?? p.selections ?? 0,
-      skips: p.skips ?? 0,
-      answered: p.answered ?? 0,
-    }));
+    const prevById = Object.fromEntries((st?.players || []).map((p) => [p.id, p]));
+    // Prefer the live room roster so lateJoin survives game-only broadcasts
+    const liveById = Object.fromEntries((state?.players || []).map((p) => [p.id, p]));
+    const lateIds = lateJoinIdSet(st);
+    return (players || []).map((p) => {
+      const prev = prevById[p.id] || liveById[p.id];
+      const lateJoin = !!(
+        p.lateJoin ||
+        prev?.lateJoin ||
+        lateIds.has(p.id)
+      );
+      return {
+        ...p,
+        selections: map[p.id] ?? p.selections ?? 0,
+        skips: p.skips ?? 0,
+        answered: p.answered ?? 0,
+        lateJoin,
+        joinedAt: p.joinedAt ?? prev?.joinedAt ?? 0,
+        isHost: !!(st?.hostId ? p.id === st.hostId : p.isHost || prev?.isHost),
+      };
+    });
   }
 
   function getPlayer(id, st = state) {
     return (st?.players || []).find((p) => p.id === id);
+  }
+
+  /** Next host = earliest joiner still in the room (excluding someone leaving). */
+  function nextHostCandidate(excludeId, st = state) {
+    return activePlayers(st)
+      .filter((p) => p.id !== excludeId)
+      .slice()
+      .sort((a, b) => {
+        const aj = a.joinedAt || 0;
+        const bj = b.joinedAt || 0;
+        if (aj !== bj) return aj - bj;
+        return String(a.id).localeCompare(String(b.id));
+      })[0] || null;
+  }
+
+  function assignHost(newHostId, st = state) {
+    if (!st || !newHostId) return;
+    st.hostId = newHostId;
+    (st.players || []).forEach((p) => {
+      p.isHost = p.id === newHostId;
+    });
+  }
+
+  function removePlayerFromState(playerId, st = state) {
+    if (!st || !playerId) return;
+    st.players = (st.players || []).filter((p) => p.id !== playerId);
+    if (st.selectionsById && playerId in st.selectionsById) {
+      delete st.selectionsById[playerId];
+    }
+    if (Array.isArray(st.lateJoinIds)) {
+      st.lateJoinIds = st.lateJoinIds.filter((id) => id !== playerId);
+    }
+  }
+
+  /** Keep local me/sync flags aligned with state.hostId (host handoff). */
+  function syncHostRole() {
+    if (!state || !me?.id) return;
+    const shouldBeHost = state.hostId === me.id;
+    if (shouldBeHost && !me.isHost) {
+      me.isHost = true;
+      if (sync) sync.isHost = true;
+      saveSession();
+      recoverHostProgress();
+      toast("You’re the host now — the room keeps going");
+      updateHostRoomCode();
+    } else if (!shouldBeHost && me.isHost) {
+      me.isHost = false;
+      if (sync) sync.isHost = false;
+      saveSession();
+      updateHostRoomCode();
+    } else if (shouldBeHost && sync && !sync.isHost) {
+      sync.isHost = true;
+    }
+  }
+
+  /**
+   * If the leaver was mid-turn, advance so the room doesn’t freeze.
+   * Call while still acting as host, after removing them.
+   */
+  function repairTurnAfterLeave(leftId) {
+    if (!state || !leftId) return;
+    if (state.phase === "finals" && state.finals) {
+      const f = state.finals;
+      if (f.aId === leftId || f.bId === leftId) {
+        // One finalist left — end match in their opponent’s favor if possible
+        const otherId = f.aId === leftId ? f.bId : f.aId;
+        const other = getPlayer(otherId);
+        if (other && !other.kicked) {
+          state.winnerId = otherId;
+          state.revealForId = pickAuthorRevealId();
+          state.phase = "end";
+          state.finals = null;
+        }
+      } else if (f.buzzedBy === leftId) {
+        f.buzzedBy = null;
+        f.phase = "open";
+      }
+      return;
+    }
+    if (
+      (state.phase === "spinning" ||
+        state.phase === "answering" ||
+        state.phase === "confirm") &&
+      state.currentPlayerId === leftId
+    ) {
+      if (shouldGoToFinals()) startFinals();
+      else beginWheelRound();
+    }
   }
 
   function inviteUrl(code) {
@@ -418,6 +719,7 @@
       selections: 0,
       kicked: !!row.kicked,
       isHost: !!row.is_host,
+      joinedAt: row.created_at ? Date.parse(row.created_at) || 0 : 0,
     };
   }
 
@@ -428,6 +730,7 @@
       hostId,
       questions,
       questionEndsAt,
+      answerEndsAt,
       currentPlayerId,
       currentQuestionId,
       spinToken,
@@ -435,7 +738,9 @@
       selectionsById,
       rapidFireReserve,
       startingPlayerCount,
+      poolMinQuestions,
       questionsLocked,
+      lateJoinIds,
       finals,
       winnerId,
       revealForId,
@@ -449,6 +754,7 @@
       hostId,
       questions,
       questionEndsAt,
+      answerEndsAt: answerEndsAt || null,
       currentPlayerId,
       currentQuestionId,
       spinToken,
@@ -456,7 +762,9 @@
       selectionsById: selectionsById || {},
       rapidFireReserve: rapidFireReserve || 0,
       startingPlayerCount: startingPlayerCount || 0,
+      poolMinQuestions: poolMinQuestions || 0,
       questionsLocked: !!questionsLocked,
+      lateJoinIds: Array.isArray(lateJoinIds) ? lateJoinIds : [],
       finals,
       winnerId,
       revealForId,
@@ -487,9 +795,10 @@
       phase: "lobby",
       roomCode: code,
       hostId: hostPlayer.id,
-      players: [hostPlayer],
+      players: [{ ...hostPlayer, joinedAt: hostPlayer.joinedAt || Date.now() }],
       questions: [],
       questionEndsAt: null,
+      answerEndsAt: null,
       currentPlayerId: null,
       currentQuestionId: null,
       spinToken: 0,
@@ -497,7 +806,9 @@
       selectionsById: {},
       rapidFireReserve: 0,
       startingPlayerCount: 0,
+      poolMinQuestions: 0,
       questionsLocked: false,
+      lateJoinIds: [],
       finals: null,
       winnerId: null,
       revealForId: null,
@@ -552,6 +863,25 @@
       console.log("Player added!", player.name, "→ room", this.code);
     }
 
+    async deletePlayer(playerId) {
+      if (!playerId) return;
+      const { error } = await db()
+        .from("players")
+        .delete()
+        .eq("id", playerId)
+        .eq("room_id", this.code);
+      if (error) console.error("Failed to remove player:", error);
+    }
+
+    async setRoomHost(hostId) {
+      if (!hostId) return;
+      const { error } = await db()
+        .from("rooms")
+        .update({ host_id: hostId, updated_at: new Date().toISOString() })
+        .eq("code", this.code);
+      if (error) console.error("Failed to update room host:", error);
+    }
+
     async fetchPlayers() {
       const { data, error } = await db()
         .from("players")
@@ -581,7 +911,8 @@
         if (resume) {
           const room = await this.ensureRoom(hostPlayer, { fresh: false });
           const players = await this.fetchPlayers();
-          if (!players.some((p) => p.id === hostPlayer.id)) {
+          const stillHost = room?.host_id === hostPlayer.id;
+          if (!players.some((p) => p.id === hostPlayer.id) && stillHost) {
             await this.addPlayer(hostPlayer);
           }
           if (room) {
@@ -703,6 +1034,24 @@
           if (payload?.playerId === me.id) {
             handleNameTaken(payload.message);
           }
+        })
+        .on("broadcast", { event: "questionRejected" }, ({ payload }) => {
+          if (payload?.playerId === me.id) {
+            handleQuestionRejected(payload.message);
+          }
+        })
+        .on("broadcast", { event: "playerKicked" }, ({ payload }) => {
+          if (payload?.playerId === me.id) {
+            handleKickedOut(payload.message);
+          }
+        })
+        .on("broadcast", { event: "hostHandoff" }, ({ payload }) => {
+          if (!payload?.newHostId || !state) return;
+          if (payload.leavingId) removePlayerFromState(payload.leavingId);
+          assignHost(payload.newHostId);
+          if (payload.leavingName) toast(`${payload.leavingName} left`);
+          syncHostRole();
+          render();
         });
 
       await new Promise((resolve, reject) => {
@@ -826,6 +1175,30 @@
       });
     }
 
+    notifyQuestionRejected(payload) {
+      this.channel?.send({
+        type: "broadcast",
+        event: "questionRejected",
+        payload,
+      });
+    }
+
+    notifyHostHandoff(payload) {
+      this.channel?.send({
+        type: "broadcast",
+        event: "hostHandoff",
+        payload,
+      });
+    }
+
+    notifyPlayerKicked(payload) {
+      this.channel?.send({
+        type: "broadcast",
+        event: "playerKicked",
+        payload,
+      });
+    }
+
     destroy() {
       if (this.channel) {
         supabaseClient.removeChannel(this.channel);
@@ -865,6 +1238,19 @@
       if (msg.type === "joinRejected" && msg.payload?.playerId === me.id) {
         handleNameTaken(msg.payload.message);
       }
+      if (msg.type === "questionRejected" && msg.payload?.playerId === me.id) {
+        handleQuestionRejected(msg.payload.message);
+      }
+      if (msg.type === "playerKicked" && msg.payload?.playerId === me.id) {
+        handleKickedOut(msg.payload.message);
+      }
+      if (msg.type === "hostHandoff" && msg.payload?.newHostId && state) {
+        if (msg.payload.leavingId) removePlayerFromState(msg.payload.leavingId);
+        assignHost(msg.payload.newHostId);
+        if (msg.payload.leavingName) toast(`${msg.payload.leavingName} left`);
+        syncHostRole();
+        render();
+      }
     }
 
     async start() {
@@ -896,6 +1282,36 @@
     notifyJoinRejected(payload) {
       this.channel.postMessage({ type: "joinRejected", sourceId: me.id, payload });
     }
+
+    notifyQuestionRejected(payload) {
+      this.channel.postMessage({
+        type: "questionRejected",
+        sourceId: me.id,
+        payload,
+      });
+    }
+
+    notifyHostHandoff(payload) {
+      this.channel.postMessage({
+        type: "hostHandoff",
+        sourceId: me.id,
+        payload,
+      });
+    }
+
+    notifyPlayerKicked(payload) {
+      this.channel.postMessage({
+        type: "playerKicked",
+        sourceId: me.id,
+        payload,
+      });
+    }
+
+    async deletePlayer() {
+      /* local roster lives in shared state only */
+    }
+
+    async setRoomHost() {}
 
     destroy() {
       this.channel.close();
@@ -984,8 +1400,28 @@
 
     switch (action.type) {
       case "join": {
-        if (state.phase !== "lobby") return;
-        if (state.players.some((p) => p.id === action.player.id)) return;
+        if (state.phase === "end") {
+          sync?.notifyJoinRejected?.({
+            playerId: action.player.id,
+            reason: "ended",
+            message: "This game already ended.",
+          });
+          return;
+        }
+        const existing = state.players.find((p) => p.id === action.player.id);
+        if (existing) {
+          // Supabase may have inserted them already — still flag mid-game join
+          if (state.phase !== "lobby" && !existing.lateJoin) {
+            markLateJoin(existing.id);
+            if (!state.selectionsById) state.selectionsById = {};
+            if (!(existing.id in state.selectionsById)) {
+              state.selectionsById[existing.id] = 0;
+            }
+            publish();
+            toast(`${existing.name} joined mid-game`);
+          }
+          return;
+        }
         if (
           state.players.some(
             (p) => p.name.toLowerCase() === String(action.player.name || "").trim().toLowerCase()
@@ -998,16 +1434,51 @@
           });
           return;
         }
+        const lateJoin = state.phase !== "lobby";
+        const newId = action.player.id;
         state.players.push({
-          id: action.player.id,
+          id: newId,
           name: String(action.player.name || "").trim(),
           answered: 0,
           skips: 0,
           selections: 0,
           kicked: false,
           isHost: false,
+          lateJoin,
+          joinedAt: Date.now(),
         });
+        if (lateJoin) {
+          markLateJoin(newId);
+          if (!state.selectionsById) state.selectionsById = {};
+          state.selectionsById[newId] = 0;
+        }
         publish();
+        if (lateJoin) {
+          toast(`${String(action.player.name || "").trim()} joined mid-game`);
+        }
+        break;
+      }
+      case "leave": {
+        const leftId = action.playerId;
+        if (!leftId || !getPlayer(leftId)) return;
+        const name = getPlayer(leftId)?.name || "Player";
+        const wasHost = state.hostId === leftId;
+        removePlayerFromState(leftId);
+        if (wasHost) {
+          const next = nextHostCandidate(null);
+          if (next) {
+            assignHost(next.id);
+            sync?.notifyHostHandoff?.({
+              newHostId: next.id,
+              leavingId: leftId,
+            });
+            toast(`${next.name} is the new host`);
+          }
+        }
+        repairTurnAfterLeave(leftId);
+        publish();
+        sync?.deletePlayer?.(leftId);
+        toast(`${name} left the room`);
         break;
       }
       case "startQuestions": {
@@ -1017,6 +1488,7 @@
         if (activePlayers().length < 2) return;
         state.phase = "questions";
         state.questionsLocked = false;
+        state.poolMinQuestions = Math.max(2, poolPlayers().length) * 5;
         state.questionEndsAt = Date.now() + QUESTION_SECONDS * 1000;
         publish();
         break;
@@ -1026,7 +1498,18 @@
         const text = String(action.text || "").trim();
         if (!text) return;
         const author = getPlayer(action.playerId);
-        if (!author || author.kicked) return;
+        if (!author || author.kicked || author.lateJoin) return;
+        if (questionAlreadyInPool(text)) {
+          const msg = "That question is already in the pool.";
+          if (action.playerId === me.id) handleQuestionRejected(msg);
+          else {
+            sync?.notifyQuestionRejected?.({
+              playerId: action.playerId,
+              message: msg,
+            });
+          }
+          return;
+        }
         const entry = {
           id: uid(),
           text,
@@ -1048,11 +1531,18 @@
         break;
       }
       case "skip": {
-        if (state.phase !== "answering") return;
+        if (state.phase !== "answering" && state.phase !== "confirm") return;
         if (action.playerId !== state.currentPlayerId) return;
+        const requester = action.requestedBy || action.playerId;
+        const hostForce = requester === state.hostId && requester !== action.playerId;
+        if (requester !== action.playerId && !hostForce) return;
+        // Players may only skip while answering; host can force-skip in confirm too
+        if (!hostForce && state.phase !== "answering") return;
         const player = getPlayer(action.playerId);
         const q = state.questions.find((x) => x.id === state.currentQuestionId);
         if (!player || !q) return;
+        clearAnswerTimers();
+        state.answerEndsAt = null;
         player.skips += 1;
         // Consume this normal-phase question (does not move into rapid-fire reserve)
         q.used = true;
@@ -1061,6 +1551,9 @@
           toast(`${player.name} is out (3 skips)`);
         }
         logQuestionOutcome({ question: q, player, pot: "wheel", outcome: "skipped" });
+        if (hostForce) {
+          toast(`Host skipped for ${player.name}`);
+        }
         state.currentPlayerId = null;
         state.currentQuestionId = null;
         if (shouldGoToFinals()) {
@@ -1073,9 +1566,36 @@
         }
         break;
       }
+      case "answerTimeout": {
+        if (state.phase !== "answering") return;
+        if (!state.currentPlayerId || !state.currentQuestionId) return;
+        passQuestionOnTimeout();
+        break;
+      }
+      case "kick": {
+        // Host removes someone from the room entirely
+        if (action.requestedBy !== state.hostId) return;
+        const targetId = action.playerId;
+        if (!targetId || targetId === state.hostId) return;
+        const target = getPlayer(targetId);
+        if (!target) return;
+        const name = target.name;
+        removePlayerFromState(targetId);
+        repairTurnAfterLeave(targetId);
+        publish();
+        sync?.deletePlayer?.(targetId);
+        sync?.notifyPlayerKicked?.({
+          playerId: targetId,
+          message: "The host removed you from the room.",
+        });
+        toast(`${name} was removed`);
+        break;
+      }
       case "chooseAnswer": {
         if (state.phase !== "answering") return;
         if (action.playerId !== state.currentPlayerId) return;
+        clearAnswerTimers();
+        state.answerEndsAt = null;
         state.phase = "confirm";
         publish();
         break;
@@ -1086,6 +1606,8 @@
         const player = getPlayer(action.playerId);
         const q = state.questions.find((x) => x.id === state.currentQuestionId);
         if (!player || !q) return;
+        clearAnswerTimers();
+        state.answerEndsAt = null;
         player.answered += 1;
         q.used = true;
         logQuestionOutcome({ question: q, player, pot: "wheel", outcome: "answered" });
@@ -1164,7 +1686,7 @@
       toast("Need at least 2 players");
       return;
     }
-    const minQ = players.length * 5;
+    const minQ = minimumQuestionsRequired();
     if (state.questions.length < minQ) {
       toast("Need at least " + minQ + " questions before starting");
       return;
@@ -1209,6 +1731,38 @@
     return pool[0];
   }
 
+  /**
+   * Fair wheel target: everyone gets a turn before anyone gets another.
+   * Among equally picked players, prefer whoever has answered fewer times.
+   * Random only breaks remaining ties.
+   */
+  function pickFairWheelPlayer(candidates, excludeId = null) {
+    const pool = (candidates || []).filter(
+      (p) => p && p.id !== excludeId && !p.kicked
+    );
+    if (!pool.length) return null;
+    if (pool.length === 1) return pool[0];
+
+    let minTurns = Infinity;
+    let minAnswered = Infinity;
+    pool.forEach((p) => {
+      const turns = getSelections(p);
+      const answered = p.answered ?? 0;
+      if (turns < minTurns) {
+        minTurns = turns;
+        minAnswered = answered;
+      } else if (turns === minTurns && answered < minAnswered) {
+        minAnswered = answered;
+      }
+    });
+
+    const tied = pool.filter(
+      (p) =>
+        getSelections(p) === minTurns && (p.answered ?? 0) === minAnswered
+    );
+    return tied[(Math.random() * tied.length) | 0];
+  }
+
   function beginWheelRound() {
     const alive = wheelPlayers();
     const left = normalQuestions();
@@ -1218,8 +1772,11 @@
       return;
     }
 
-    // Truly random wheel — no balancing, repeats allowed
-    const player = alive[(Math.random() * alive.length) | 0];
+    const player = pickFairWheelPlayer(alive);
+    if (!player) {
+      startFinals();
+      return;
+    }
     setSelections(player, getSelections(player) + 1);
 
     const q = pickQuestionForPlayer(player, left);
@@ -1238,13 +1795,13 @@
     state.spinToken += 1;
     state.currentPlayerId = player.id;
     state.currentQuestionId = q.id;
+    state.answerEndsAt = null;
     publish();
 
     setTimeout(() => {
       if (!state || state.phase !== "spinning") return;
       if (state.currentPlayerId !== player.id) return;
-      state.phase = "answering";
-      publish();
+      openAnsweringPhase({ freshDeadline: true });
     }, SPIN_MS + 180);
   }
 
@@ -1376,7 +1933,7 @@
       buzzedBy: null,
       phase: "show",
       buzzOpensAt: Date.now() + BUZZ_REVEAL_MS,
-      endsAt: Date.now() + FINALS_SECONDS * 1000,
+      endsAt: null,
     };
     publish();
   }
@@ -1391,9 +1948,6 @@
     // Show question first; buzzer arms after a short beat
     state.finals.phase = "show";
     state.finals.buzzOpensAt = Date.now() + BUZZ_REVEAL_MS;
-    if (!state.finals.endsAt) {
-      state.finals.endsAt = Date.now() + FINALS_SECONDS * 1000;
-    }
     publish();
   }
 
@@ -1401,10 +1955,7 @@
     if (!state.finals) return;
     state.finals.index += 1;
     state.finals.buzzedBy = null;
-    if (
-      state.finals.index >= state.finals.questions.length ||
-      (state.finals.endsAt && Date.now() >= state.finals.endsAt)
-    ) {
+    if (state.finals.index >= state.finals.questions.length) {
       finishFinals();
       return;
     }
@@ -1590,6 +2141,41 @@
   }
 
   // ---------- render ----------
+  function updateHostRoomCode() {
+    const show = !!(me.isHost && state?.roomCode);
+    if (els.hostRoomCode) {
+      els.hostRoomCode.hidden = !show;
+      if (!show) els.hostRoomCode.style.display = "none";
+      else els.hostRoomCode.style.display = "";
+    }
+    if (els.hostRoomCodeValue && state?.roomCode) {
+      els.hostRoomCodeValue.textContent = state.roomCode;
+    }
+    if (els.lobbyRoomChip) {
+      els.lobbyRoomChip.hidden = !me.isHost;
+      els.lobbyRoomChip.style.display = me.isHost ? "" : "none";
+    }
+    if (els.lobbyCode && state?.roomCode) {
+      els.lobbyCode.textContent = state.roomCode;
+    }
+  }
+
+  function updateLeaveButtons() {
+    const inRoom =
+      !!state &&
+      !!me?.id &&
+      state.phase !== "end" &&
+      ["lobby", "questions", "spinning", "answering", "confirm", "finals"].includes(
+        state.phase
+      );
+    if (els.btnLeaveRoom) {
+      els.btnLeaveRoom.hidden = !inRoom || state.phase === "lobby";
+    }
+    if (els.btnLeaveLobby) {
+      els.btnLeaveLobby.hidden = !(inRoom && state.phase === "lobby");
+    }
+  }
+
   function render() {
     if (!state) return;
 
@@ -1597,9 +2183,13 @@
     questionTick = null;
     clearInterval(finalsTick);
     finalsTick = null;
+    clearInterval(answerDeadlineTick);
+    answerDeadlineTick = null;
 
     const self = getPlayer(me.id);
     els.kickedOverlay.hidden = !(self && self.kicked && state.phase !== "end" && state.phase !== "lobby");
+    updateHostRoomCode();
+    updateLeaveButtons();
 
     switch (state.phase) {
       case "lobby":
@@ -1630,14 +2220,25 @@
   }
 
   function renderLobby() {
-    els.lobbyCode.textContent = state.roomCode;
+    updateHostRoomCode();
     els.playerList.innerHTML = "";
     state.players.forEach((p) => {
       const li = document.createElement("li");
       li.className = "player-pill";
       if (p.isHost) li.classList.add("host");
       if (p.id === me.id) li.classList.add("you");
-      li.innerHTML = `<span class="name">${escapeHtml(p.name)}</span><span class="meta">${p.id === me.id ? "you" : p.isHost ? "host" : "joined"}</span>`;
+      const meta =
+        p.id === me.id ? "you" : p.isHost ? "host" : "joined";
+      li.innerHTML = `<span class="name">${escapeHtml(p.name)}</span><span class="meta">${meta}</span>`;
+      if (me.isHost && p.id !== me.id) {
+        const kick = document.createElement("button");
+        kick.type = "button";
+        kick.className = "btn-kick";
+        kick.textContent = "Remove";
+        kick.title = `Remove ${p.name}`;
+        kick.onclick = () => hostKickPlayer(p.id, p.name);
+        li.appendChild(kick);
+      }
       els.playerList.appendChild(li);
     });
 
@@ -1955,8 +2556,10 @@
   }
 
   function renderQuestions() {
-    const nPlayers = activePlayers().length;
-    const minQ = nPlayers * 5;
+    const self = getPlayer(me.id);
+    const late = !!self?.lateJoin;
+    const nPlayers = poolPlayers().length || activePlayers().length;
+    const minQ = minimumQuestionsRequired();
     const have = state.questions?.length || 0;
     const ready = have >= minQ;
     const remaining =
@@ -1971,9 +2574,12 @@
 
     const title = document.querySelector("#screen-questions .section-title");
     const sub = document.querySelector("#screen-questions .section-sub");
-    if (title) title.textContent = "Question pool";
+    if (title) title.textContent = late ? "You’re in" : "Question pool";
     if (sub) {
-      if (me.isHost) {
+      if (late) {
+        sub.textContent =
+          "You joined mid-game — hang tight. You’ll play with the questions already in the pool once the host starts.";
+      } else if (me.isHost) {
         sub.textContent = ready
           ? "Pool ready! Keep adding until the timer ends, or start the game now."
           : `One shared pot · at least ${minQ} questions (${nPlayers}×5) · ${formatTime(Math.max(0, remaining))} left to add more.`;
@@ -1986,10 +2592,12 @@
 
     const statusEl = document.getElementById("pool-status");
     if (statusEl) {
-      statusEl.textContent = ready
-        ? `✓ Enough questions to start · ${have} / ${minQ}`
-        : `${have} / ${minQ} minimum questions`;
-      statusEl.classList.toggle("pool-ready", ready);
+      statusEl.textContent = late
+        ? `Watching · ${have} questions in the pool`
+        : ready
+          ? `✓ Enough questions to start · ${have} / ${minQ}`
+          : `${have} / ${minQ} minimum questions`;
+      statusEl.classList.toggle("pool-ready", ready && !late);
     }
 
     // Host-only: start the wheel once the pool minimum is met
@@ -2029,11 +2637,55 @@
       els.myQuestions.appendChild(li);
     });
 
-    if (els.questionInput) els.questionInput.disabled = !!state.questionsLocked;
+    const allowSubmit = canSubmitQuestions();
+    if (els.questionForm) {
+      els.questionForm.hidden = !allowSubmit;
+      els.questionForm.style.display = allowSubmit ? "" : "none";
+    }
+    if (els.ideasPanel) {
+      els.ideasPanel.hidden = !allowSubmit;
+      els.ideasPanel.style.display = allowSubmit ? "" : "none";
+    }
+    if (els.questionInput) els.questionInput.disabled = !allowSubmit;
     const addBtn = els.questionForm?.querySelector('button[type="submit"]');
-    if (addBtn) addBtn.disabled = !!state.questionsLocked;
+    if (addBtn) addBtn.disabled = !allowSubmit;
 
     ensureIdeasPanel();
+
+    // Host can remove players during the question pool
+    let hostKickList = document.getElementById("host-kick-list");
+    if (me.isHost) {
+      if (!hostKickList) {
+        const aside = document.querySelector("#screen-questions .questions-aside");
+        if (aside) {
+          hostKickList = document.createElement("ul");
+          hostKickList.id = "host-kick-list";
+          hostKickList.className = "host-kick-list";
+          aside.appendChild(hostKickList);
+        }
+      }
+      if (hostKickList) {
+        hostKickList.hidden = false;
+        hostKickList.innerHTML = "";
+        activePlayers()
+          .filter((p) => p.id !== me.id)
+          .forEach((p) => {
+            const li = document.createElement("li");
+            li.className = "host-kick-row";
+            li.innerHTML = `<span>${escapeHtml(p.name)}</span>`;
+            const kick = document.createElement("button");
+            kick.type = "button";
+            kick.className = "btn-kick";
+            kick.textContent = "Remove";
+            kick.onclick = () => hostKickPlayer(p.id, p.name);
+            li.appendChild(kick);
+            hostKickList.appendChild(li);
+          });
+      }
+    } else if (hostKickList) {
+      hostKickList.hidden = true;
+      hostKickList.innerHTML = "";
+    }
 
     questionTick = setInterval(() => {
       if (!state || state.phase !== "questions" || state.questionsLocked) return;
@@ -2046,7 +2698,7 @@
       if (!me.isHost) return;
       clearInterval(questionTick);
       questionTick = null;
-      const minNeeded = activePlayers().length * 5;
+      const minNeeded = minimumQuestionsRequired();
       if ((state.questions?.length || 0) >= minNeeded) {
         handleAction({ type: "questionsDone", playerId: me.id });
       } else {
@@ -2060,13 +2712,49 @@
     }, 250);
   }
 
+  function hostKickPlayer(playerId, name) {
+    if (!me.isHost || !playerId || playerId === me.id) return;
+    if (!window.confirm(`Remove ${name || "this player"} from the room?`)) return;
+    send({ type: "kick", playerId, requestedBy: me.id });
+  }
+
+  function hostSkipForCurrent() {
+    if (!me.isHost || !state?.currentPlayerId) return;
+    const picked = getPlayer(state.currentPlayerId);
+    if (!picked) return;
+    if (
+      !window.confirm(
+        `Skip this question for ${picked.name}? Counts as one of their skips.`
+      )
+    ) {
+      return;
+    }
+    send({
+      type: "skip",
+      playerId: picked.id,
+      requestedBy: me.id,
+    });
+  }
+
   function renderGame() {
     const alive = wheelPlayers();
     els.scoreStrip.innerHTML = "";
     alive.forEach((p) => {
       const chip = document.createElement("span");
       chip.className = "score-chip";
-      chip.innerHTML = `${escapeHtml(p.name)} · picks <strong>${getSelections(p)}</strong> · skips <strong>${p.skips}/${MAX_SKIPS}</strong>`;
+      chip.innerHTML = `${escapeHtml(p.name)} · answered <strong>${p.answered ?? 0}</strong> · picks <strong>${getSelections(p)}</strong> · skips <strong>${p.skips}/${MAX_SKIPS}</strong>`;
+      if (me.isHost && p.id !== me.id) {
+        const kick = document.createElement("button");
+        kick.type = "button";
+        kick.className = "btn-kick btn-kick-chip";
+        kick.textContent = "×";
+        kick.title = `Remove ${p.name}`;
+        kick.onclick = (e) => {
+          e.stopPropagation();
+          hostKickPlayer(p.id, p.name);
+        };
+        chip.appendChild(kick);
+      }
       els.scoreStrip.appendChild(chip);
     });
 
@@ -2114,6 +2802,24 @@
     panel.appendChild(qEl);
 
     if (state.phase === "answering") {
+      const deadlineEl = document.createElement("p");
+      deadlineEl.className = "answer-deadline";
+      deadlineEl.id = "answer-deadline";
+      panel.appendChild(deadlineEl);
+
+      const paintDeadline = () => {
+        if (!state || state.phase !== "answering") return;
+        const ends = state.answerEndsAt || Date.now() + ANSWER_SECONDS * 1000;
+        const left = Math.max(0, (ends - Date.now()) / 1000);
+        deadlineEl.textContent =
+          left > 0
+            ? `${formatTime(left)} to skip or answer`
+            : "Time’s up — passing on…";
+        deadlineEl.classList.toggle("urgent", left <= 10);
+      };
+      paintDeadline();
+      answerDeadlineTick = setInterval(paintDeadline, 200);
+
       if (isMe) {
         const warn = document.createElement("p");
         warn.className = "skip-warn";
@@ -2130,14 +2836,30 @@
           <button type="button" class="btn btn-primary" id="btn-answer">I’ll answer</button>
         `;
         panel.appendChild(row);
-        $("#btn-skip", panel).onclick = () => send({ type: "skip", playerId: me.id });
-        $("#btn-answer", panel).onclick = () => send({ type: "chooseAnswer", playerId: me.id });
+        $("#btn-skip", panel).onclick = () =>
+          send({ type: "skip", playerId: me.id, requestedBy: me.id });
+        $("#btn-answer", panel).onclick = () =>
+          send({ type: "chooseAnswer", playerId: me.id });
       } else {
         const note = document.createElement("p");
         note.className = "waiting-note";
         note.textContent = `Waiting for ${picked.name} to skip or answer…`;
         panel.appendChild(note);
+        if (me.isHost) {
+          const row = document.createElement("div");
+          row.className = "choice-row host-force-row";
+          const skipBtn = document.createElement("button");
+          skipBtn.type = "button";
+          skipBtn.className = "btn btn-danger";
+          skipBtn.textContent = `Skip for ${picked.name}`;
+          skipBtn.onclick = () => hostSkipForCurrent();
+          row.appendChild(skipBtn);
+          panel.appendChild(row);
+        }
       }
+
+      // Host: keep the respond timer armed across re-renders
+      if (me.isHost) armAnswerTimeout();
     }
 
     if (state.phase === "confirm") {
@@ -2157,6 +2879,17 @@
         note.className = "waiting-note";
         note.textContent = `${picked.name} is answering out loud…`;
         panel.appendChild(note);
+        if (me.isHost) {
+          const row = document.createElement("div");
+          row.className = "choice-row host-force-row";
+          const skipBtn = document.createElement("button");
+          skipBtn.type = "button";
+          skipBtn.className = "btn btn-danger";
+          skipBtn.textContent = `Skip for ${picked.name}`;
+          skipBtn.onclick = () => hostSkipForCurrent();
+          row.appendChild(skipBtn);
+          panel.appendChild(row);
+        }
       }
     }
   }
@@ -2199,7 +2932,8 @@
       if (me.isHost) send({ type: "startFinalsClock" });
       els.finalsPhaseLabel.textContent = "Rapid Fire";
       els.finalsQuestion.textContent = "Starting…";
-      els.finalsTimer.textContent = formatTime(FINALS_SECONDS);
+      const totalReady = f.questions?.length || 0;
+      els.finalsTimer.textContent = totalReady ? `1 / ${totalReady}` : "—";
       if (els.buzzerHint) els.buzzerHint.textContent = "Starting…";
       return;
     }
@@ -2214,18 +2948,15 @@
       els.finalsQuestion.textContent = q.text;
     }
 
-    const updateTimer = () => {
+    const totalQs = f.questions?.length || 0;
+    const qNum = Math.min((f.index || 0) + 1, totalQs);
+    if (els.finalsTimer) {
+      els.finalsTimer.textContent = totalQs ? `${qNum} / ${totalQs}` : "—";
+    }
+
+    const updateTick = () => {
       if (!state?.finals) return;
       const cur = state.finals;
-      if (cur.endsAt) {
-        const left = (cur.endsAt - Date.now()) / 1000;
-        els.finalsTimer.textContent = formatTime(left);
-        if (left <= 0 && me.isHost && cur.phase !== "ready") {
-          clearInterval(finalsTick);
-          finishFinals();
-          return;
-        }
-      }
       // Question is visible; arm buzzers after the reveal beat
       if (
         cur.phase === "show" &&
@@ -2235,9 +2966,9 @@
         send({ type: "openBuzzers" });
       }
     };
-    updateTimer();
+    updateTick();
     clearInterval(finalsTick);
-    finalsTick = setInterval(updateTimer, 200);
+    finalsTick = setInterval(updateTick, 200);
 
     const amBuzzed = me.id === f.buzzedBy;
     const buzzedName = getPlayer(f.buzzedBy)?.name || "Player";
@@ -2355,6 +3086,7 @@
 
   // ---------- room bootstrap ----------
   function applyPlayers(players) {
+    const prevIds = new Set((state?.players || []).map((p) => p.id));
     if (!state) {
       state = mergeGameIntoState({ roomCode: sync?.code, phase: "lobby" }, players);
     } else {
@@ -2363,12 +3095,37 @@
         players: hydratePlayerStats(players, state),
       };
     }
-    render();
+    const newcomers = (players || []).filter((p) => !prevIds.has(p.id));
+    const midGame =
+      state.phase && state.phase !== "lobby" && state.phase !== "end";
+    // Host: flag + persist mid-game joiners (Supabase path adds them to players before join action)
+    if (me.isHost && midGame && newcomers.length) {
+      let marked = false;
+      newcomers.forEach((p) => {
+        if (p.isHost) return;
+        const already = lateJoinIdSet().has(p.id) || getPlayer(p.id)?.lateJoin;
+        markLateJoin(p.id);
+        if (!state.selectionsById) state.selectionsById = {};
+        if (!(p.id in state.selectionsById)) state.selectionsById[p.id] = 0;
+        if (!already) {
+          const name = getPlayer(p.id)?.name || p.name;
+          toast(`${name} joined mid-game`);
+          marked = true;
+        } else {
+          marked = true;
+        }
+      });
+      if (marked) publish();
+      else render();
+    } else {
+      render();
+    }
   }
 
   function applyGameState(st) {
     const players = state?.players || st.players || [];
     state = mergeGameIntoState(st, players);
+    syncHostRole();
     render();
   }
 
@@ -2501,6 +3258,10 @@
           saveSession();
           if (!joined && !opts.resumeId) {
             joined = true;
+            if (st.phase === "end") {
+              handleNameTaken("This game already ended.");
+              return;
+            }
             const taken = (st.players || []).some(
               (p) =>
                 p.id !== me.id &&
@@ -2516,6 +3277,9 @@
               type: "join",
               player: { id: me.id, name: me.name },
             });
+            if (st.phase !== "lobby") {
+              toast("Joined mid-game — you’ll play with the existing question pool");
+            }
           }
         };
         sync.onAction = handleAction;
@@ -2541,12 +3305,29 @@
         };
         await sync.start({ hostPlayer, resume: true });
         const players = await sync.fetchPlayers();
+        const room = await sync.fetchRoom?.();
         const meRow = players.find((p) => p.id === me.id);
-        me.isHost = meRow ? !!meRow.isHost : true;
+        // Trust the live room host — don’t reclaim host after a handoff
+        const reallyHost =
+          (room && room.host_id === me.id) || !!(meRow && meRow.isHost);
+        me.isHost = !!reallyHost;
         sync.isHost = me.isHost;
-        applyPlayers(players);
+        if (!meRow && !reallyHost) {
+          // Session thought we were host but we already left — join as guest
+          await sync.addPlayer({
+            id: me.id,
+            name: me.name,
+            answered: 0,
+            skips: 0,
+            kicked: false,
+            isHost: false,
+          });
+          send({ type: "join", player: { id: me.id, name: me.name } });
+        }
+        applyPlayers(await sync.fetchPlayers());
         restoreMyLocalQuestionsFromState();
-        recoverHostProgress();
+        if (me.isHost) recoverHostProgress();
+        syncHostRole();
         render();
       } else {
         attachSyncHandlers();
@@ -2561,15 +3342,28 @@
         };
         await sync.start({ joinPlayer, resume: !!resumeId });
         if (!state) throw new Error("Room not found. Check ?room=CODE.");
+        if (!resumeId && state.phase === "end") {
+          throw new Error("This game already ended.");
+        }
         const players = state.players || [];
         const meRow = players.find((p) => p.id === me.id);
         if (meRow) {
           me.isHost = !!meRow.isHost;
           sync.isHost = me.isHost;
         }
+        // Ensure host marks mid-game joiners (and local joiners) in shared state
+        if (!resumeId) {
+          send({
+            type: "join",
+            player: { id: me.id, name: me.name },
+          });
+        }
         restoreMyLocalQuestionsFromState();
         if (me.isHost) recoverHostProgress();
         render();
+        if (!resumeId && state.phase !== "lobby") {
+          toast("Joined mid-game — you’ll play with the existing question pool");
+        }
       }
 
       const url = new URL(location.href);
@@ -2606,6 +3400,79 @@
       clearSession(code);
       return false;
     }
+  }
+
+  function resetToHomeUi() {
+    myLocalQuestions = [];
+    revealCurtainPlayed = false;
+    ideaReel = [];
+    ideaReserve = [];
+    ideaOffset = 0;
+    pendingIdea = null;
+    pendingReplacementId = null;
+    ideaFilter = null;
+    lastSpinToken = -1;
+    els.revealPanel?.classList.remove("is-open");
+    if (els.revealList) els.revealList.innerHTML = "";
+    history.replaceState(null, "", "/");
+    resetHomeToFirstLook();
+    showScreen("home");
+    updateHostRoomCode();
+    if (els.btnLeaveRoom) els.btnLeaveRoom.hidden = true;
+    if (els.btnLeaveLobby) els.btnLeaveLobby.hidden = true;
+    els.playerName.value = "";
+    els.roomCode.value = "";
+    setHomeError("");
+  }
+
+  /**
+   * Leave the room. If you’re host, hand off to the earliest remaining
+   * joiner so the game keeps running.
+   */
+  async function leaveRoom() {
+    if (!state || !me?.id) return;
+    const code = state.roomCode;
+    const leavingId = me.id;
+    const wasHost = me.isHost || state.hostId === leavingId;
+    const leavingName = me.name;
+
+    try {
+      if (wasHost) {
+        const next = nextHostCandidate(leavingId);
+        removePlayerFromState(leavingId);
+        if (next) {
+          assignHost(next.id);
+          repairTurnAfterLeave(leavingId);
+          await publish();
+          await sync?.setRoomHost?.(next.id);
+          sync?.notifyHostHandoff?.({
+            newHostId: next.id,
+            leavingId,
+            leavingName,
+          });
+        } else {
+          // Alone — nothing to hand off; room stays in DB but empty of you
+          await publish();
+        }
+        await sync?.deletePlayer?.(leavingId);
+      } else {
+        send({ type: "leave", playerId: leavingId });
+        // Give the host a beat to process before we drop the channel
+        await new Promise((r) => setTimeout(r, 200));
+      }
+    } catch (err) {
+      console.error("Leave failed:", err);
+    }
+
+    if (code) clearSession(code);
+    try {
+      sync?.destroy?.();
+    } catch (_) {}
+    sync = null;
+    state = null;
+    me = { id: null, name: "", isHost: false };
+    resetToHomeUi();
+    toast(wasHost ? "You left — host passed on" : "You left the room");
   }
 
   let inviteMode = false;
@@ -2700,8 +3567,18 @@
 
   els.questionForm.addEventListener("submit", (e) => {
     e.preventDefault();
+    if (!canSubmitQuestions()) return;
     const text = els.questionInput.value.trim();
     if (!text) return;
+    if (questionAlreadyInPool(text)) {
+      els.questionFeedback.hidden = false;
+      els.questionFeedback.textContent = "That question is already in the pool.";
+      setTimeout(() => {
+        els.questionFeedback.hidden = true;
+      }, 2200);
+      toast("That question is already in the pool.");
+      return;
+    }
     // Submitted the pending prompt → keep it off the reel. Otherwise return it.
     if (pendingIdea && text === pendingIdea.text.trim()) {
       clearPendingIdeaConsumed();
@@ -2763,22 +3640,53 @@
     sync = null;
     state = null;
     me = { id: null, name: "", isHost: false };
-    myLocalQuestions = [];
-    revealCurtainPlayed = false;
-    ideaReel = [];
-    ideaReserve = [];
-    ideaOffset = 0;
-    pendingIdea = null;
-    pendingReplacementId = null;
-    ideaFilter = null;
-    els.revealPanel?.classList.remove("is-open");
-    if (els.revealList) els.revealList.innerHTML = "";
-    history.replaceState(null, "", "/");
-    resetHomeToFirstLook();
-    showScreen("home");
-    els.playerName.value = "";
-    els.roomCode.value = "";
-    setHomeError("");
+    resetToHomeUi();
+  });
+
+  async function onLeaveClick() {
+    if (!state || !me?.id) return;
+    const msg =
+      me.isHost || state.hostId === me.id
+        ? "Leave and pass host to the next player?"
+        : "Leave this room?";
+    if (!window.confirm(msg)) return;
+    if (els.btnLeaveRoom) els.btnLeaveRoom.disabled = true;
+    if (els.btnLeaveLobby) els.btnLeaveLobby.disabled = true;
+    try {
+      await leaveRoom();
+    } finally {
+      if (els.btnLeaveRoom) els.btnLeaveRoom.disabled = false;
+      if (els.btnLeaveLobby) els.btnLeaveLobby.disabled = false;
+    }
+  }
+
+  els.btnLeaveRoom?.addEventListener("click", onLeaveClick);
+  els.btnLeaveLobby?.addEventListener("click", onLeaveClick);
+
+  // Best-effort host handoff if the tab closes mid-game
+  window.addEventListener("pagehide", () => {
+    if (!state || !me?.id) return;
+    if (!(me.isHost || state.hostId === me.id)) return;
+    const next = nextHostCandidate(me.id);
+    const code = state.roomCode;
+    if (!next) {
+      if (code) clearSession(code);
+      return;
+    }
+    try {
+      removePlayerFromState(me.id);
+      assignHost(next.id);
+      repairTurnAfterLeave(me.id);
+      sync?.broadcastState?.(state);
+      sync?.setRoomHost?.(next.id);
+      sync?.notifyHostHandoff?.({
+        newHostId: next.id,
+        leavingId: me.id,
+        leavingName: me.name,
+      });
+      sync?.deletePlayer?.(me.id);
+    } catch (_) {}
+    if (code) clearSession(code);
   });
 
   // Prefill / invite-only home when opening an existing room link (?room=)

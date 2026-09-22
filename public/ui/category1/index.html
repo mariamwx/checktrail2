@@ -75,7 +75,7 @@
     <section id="screen-lobby" class="screen">
       <header class="topbar">
         <p class="brand-sm">Icebreaker</p>
-        <div class="room-chip">
+        <div class="room-chip" id="lobby-room-chip">
           <span>Room</span>
           <strong id="lobby-code">————</strong>
           <button type="button" class="btn-icon" id="btn-copy-link" title="Copy invite link">Copy link</button>
@@ -94,6 +94,7 @@
             Open question pool
           </button>
           <p class="hint" id="lobby-hint">Need at least 2 players to start.</p>
+          <button type="button" class="btn btn-ghost" id="btn-leave-lobby">Leave room</button>
         </aside>
       </div>
     </section>
@@ -181,7 +182,7 @@
           </div>
           <div class="vs-block">
             <p class="vs">VS</p>
-            <p class="finals-timer" id="finals-timer">0:45</p>
+            <p class="finals-timer" id="finals-timer">—</p>
           </div>
           <div class="finals-side finals-side-b">
             <span class="buzzer-name" id="finalist-b-name">—</span>
@@ -250,6 +251,15 @@
         <p class="hint">You can still watch — you just can’t be picked again.</p>
       </div>
     </div>
+
+    <!-- HOST-ONLY: room code always visible top-right -->
+    <div id="host-room-code" class="host-room-code" hidden>
+      <span class="host-room-code-label">Room</span>
+      <strong id="host-room-code-value">————</strong>
+    </div>
+
+    <!-- Anyone in a live room can leave; host hands off first -->
+    <button type="button" id="btn-leave-room" class="btn-leave-room" hidden>Leave room</button>
 
     <!-- TOAST -->
     <div id="toast" class="toast" hidden></div>
