@@ -615,8 +615,12 @@
   }
 
   function showScreen(name) {
-    Object.values(screens).forEach((s) => s.classList.remove("active"));
-    screens[name].classList.add("active");
+    const next = screens[name];
+    if (!next) return;
+    // Re-toggling .active every render flashes the whole stage
+    if (next.classList.contains("active")) return;
+    Object.values(screens).forEach((s) => s?.classList.remove("active"));
+    next.classList.add("active");
   }
 
   function toast(msg) {
@@ -720,8 +724,14 @@
     if (!awaitingJoinApproval) return;
     awaitingJoinApproval = false;
     hideJoinWait();
+    const code = sync?.code || state?.roomCode;
+    if (code) clearReclaim(code);
     saveSession();
-    toast("You’re in — you’ll play with the existing question pool");
+    toast(
+      state?.phase === "lobby"
+        ? "You’re back in the room"
+        : "You’re in — you’ll play with the existing question pool"
+    );
     render();
   }
 
@@ -762,9 +772,15 @@
   async function promptAdmitJoiner(action) {
     const id = action?.player?.id;
     const name = String(action?.player?.name || "Someone").trim();
+    const reclaim = action?.reclaim || null;
+    const kickedBefore = wasHostKicked(id);
     if (!id || !state || !me.isHost) return;
 
-    if (state.players.some((p) => p.id === id)) return;
+    if (state.players.some((p) => p.id === id)) {
+      clearHostKicked(id);
+      sync?.notifyJoinAccepted?.({ playerId: id });
+      return;
+    }
 
     if (state.phase === "end") {
       sync?.notifyJoinRejected?.({
@@ -796,27 +812,37 @@
       return;
     }
 
+    const midGame = state.phase !== "lobby";
     const ok = await showConfirm({
-      eyebrow: "Join request",
-      title: `Let ${name} in?`,
-      message: `${name} wants to join mid-game from the invite link. They’ll use the existing question pool.`,
+      eyebrow: kickedBefore ? "Removed player" : "Join request",
+      title: kickedBefore ? `Let ${name} back in?` : `Let ${name} in?`,
+      message: kickedBefore
+        ? `${name} was removed from the room and wants to come back.${
+            midGame ? " They’ll use the existing question pool." : ""
+          }`
+        : `${name} wants to join mid-game from the invite link. They’ll use the existing question pool.`,
       cancelLabel: "Keep out",
-      okLabel: "Let in",
+      okLabel: kickedBefore ? "Let back in" : "Let in",
       danger: false,
     });
 
     if (!state || !me.isHost) return;
 
     if (!ok) {
+      // Stay on the kicked list so another attempt still needs a yes
+      if (kickedBefore) markHostKicked(id);
       sync?.notifyJoinRejected?.({
         playerId: id,
         reason: "denied",
-        message: "The host didn’t let you into this game.",
+        message: kickedBefore
+          ? "The host didn’t let you back into this room."
+          : "The host didn’t let you into this game.",
       });
       return;
     }
 
     if (state.players.some((p) => p.id === id)) {
+      clearHostKicked(id);
       sync?.notifyJoinAccepted?.({ playerId: id });
       return;
     }
@@ -833,38 +859,56 @@
       return;
     }
 
-    state.players.push({
+    const lateJoin = midGame;
+    const restored = {
       id,
       name,
-      answered: 0,
-      skips: 0,
-      selections: 0,
+      answered: reclaim?.answered ?? 0,
+      skips: reclaim?.skips ?? 0,
+      selections: reclaim?.selections ?? 0,
       kicked: false,
       isHost: false,
-      lateJoin: true,
+      lateJoin,
       connected: true,
-      joinedAt: Date.now(),
+      joinedAt: reclaim?.joinedAt || Date.now(),
+      wildcardEligible: !!reclaim?.wildcardEligible,
+      wildcardUsed: !!reclaim?.wildcardUsed,
+    };
+    state.players.push(restored);
+    if (lateJoin) markLateJoin(id);
+    else if (state.lateJoinIds) {
+      state.lateJoinIds = state.lateJoinIds.filter((x) => x !== id);
+    }
+    setWildcardMeta(id, {
+      eligible: restored.wildcardEligible,
+      used: restored.wildcardUsed,
     });
-    markLateJoin(id);
     setPlayerConnected(id, true);
     if (!state.selectionsById) state.selectionsById = {};
-    state.selectionsById[id] = 0;
+    state.selectionsById[id] = restored.selections;
+    clearHostKicked(id);
     publish();
     sync?.notifyJoinAccepted?.({ playerId: id });
     try {
       await sync?.addPlayer?.({
         id,
         name,
-        answered: 0,
-        skips: 0,
-        selections: 0,
+        answered: restored.answered,
+        skips: restored.skips,
+        selections: restored.selections,
         kicked: false,
         isHost: false,
       });
     } catch (err) {
       console.error("Failed to persist mid-game joiner:", err);
     }
-    toast(`${name} joined mid-game`);
+    toast(
+      kickedBefore
+        ? `${name} is back in the room`
+        : midGame
+          ? `${name} joined mid-game`
+          : `${name} joined`
+    );
   }
 
   function handleKickedOut(message) {
@@ -1079,6 +1123,33 @@
     });
   }
 
+  function markHostKicked(playerId, st = state) {
+    if (!st || !playerId) return;
+    if (!Array.isArray(st.hostKickedIds)) st.hostKickedIds = [];
+    if (!st.hostKickedIds.includes(playerId)) st.hostKickedIds.push(playerId);
+  }
+
+  function clearHostKicked(playerId, st = state) {
+    if (!st || !playerId || !Array.isArray(st.hostKickedIds)) return;
+    st.hostKickedIds = st.hostKickedIds.filter((id) => id !== playerId);
+  }
+
+  function wasHostKicked(playerId, st = state) {
+    return !!(
+      playerId &&
+      Array.isArray(st?.hostKickedIds) &&
+      st.hostKickedIds.includes(playerId)
+    );
+  }
+
+  /** Mid-game new seat, or anyone the host previously removed. Soft reconnect while still seated is fine. */
+  function joinNeedsHostApproval(playerId, st = state) {
+    if (!st || !playerId) return false;
+    if ((st.players || []).some((p) => p.id === playerId)) return false;
+    if (wasHostKicked(playerId, st)) return true;
+    return st.phase !== "lobby" && st.phase !== "end";
+  }
+
   function removePlayerFromState(playerId, st = state) {
     if (!st || !playerId) return;
     st.players = (st.players || []).filter((p) => p.id !== playerId);
@@ -1166,12 +1237,63 @@
     }
   }
 
+  /** Always deep-link into Icebreaker — never the hub `/`. */
   function inviteUrl(code) {
-    const url = new URL(location.href);
-    url.searchParams.set("room", code);
+    const clean = String(code || "")
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "")
+      .slice(0, 6);
+    let url;
+    try {
+      if (location.protocol === "file:") {
+        // Local file open — keep this HTML path
+        url = new URL(location.href);
+      } else {
+        url = new URL("/game.html", location.origin);
+      }
+    } catch (_) {
+      url = new URL(location.href);
+    }
+    if (clean) url.searchParams.set("room", clean);
+    else url.searchParams.delete("room");
     url.searchParams.delete("host");
-    url.searchParams.delete("local");
+    try {
+      if (
+        new URLSearchParams(location.search).get("local") === "1" ||
+        location.protocol === "file:"
+      ) {
+        url.searchParams.set("local", "1");
+      } else {
+        url.searchParams.delete("local");
+      }
+    } catch (_) {
+      url.searchParams.delete("local");
+    }
     return url.toString();
+  }
+
+  /** Keep the address bar on /game.html?room=CODE after create/join. */
+  function setGameLocation(code, { local = false } = {}) {
+    const clean = String(code || "")
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "")
+      .slice(0, 6);
+    if (!clean) return;
+    try {
+      if (location.protocol === "file:") {
+        const url = new URL(location.href);
+        url.searchParams.set("room", clean);
+        url.searchParams.delete("host");
+        if (local) url.searchParams.set("local", "1");
+        else url.searchParams.delete("local");
+        history.replaceState(null, "", url);
+        return;
+      }
+      const url = new URL("/game.html", location.origin);
+      url.searchParams.set("room", clean);
+      if (local) url.searchParams.set("local", "1");
+      history.replaceState(null, "", url);
+    } catch (_) {}
   }
 
   function mapDbPlayer(row) {
@@ -1205,6 +1327,7 @@
       poolMinQuestions,
       questionsLocked,
       lateJoinIds,
+      hostKickedIds,
       finals,
       target,
       wildcard,
@@ -1235,6 +1358,7 @@
       poolMinQuestions: poolMinQuestions || 0,
       questionsLocked: !!questionsLocked,
       lateJoinIds: Array.isArray(lateJoinIds) ? lateJoinIds : [],
+      hostKickedIds: Array.isArray(hostKickedIds) ? hostKickedIds : [],
       finals,
       target: target || null,
       wildcard: wildcard
@@ -1309,6 +1433,7 @@
       poolMinQuestions: 0,
       questionsLocked: false,
       lateJoinIds: [],
+      hostKickedIds: [],
       connectedById: { [hostId]: true },
       finals: null,
       target: null,
@@ -1636,16 +1761,23 @@
       }
     }
 
-    /** Persist + broadcast game events (NOT a global player dump) */
-    async broadcastState(st) {
-      this._pendingGame = gameOnly(st);
+    /**
+     * Persist + broadcast game events (NOT a global player dump).
+     * opts.persist === false → live broadcast only (vote ticks); avoids
+     * rooms UPDATE + player-row storms that double-render every phone.
+     */
+    async broadcastState(st, opts = {}) {
+      const persist = opts.persist !== false;
+      const syncPlayers = opts.syncPlayers !== false;
+      this._pendingGame = { snapshot: gameOnly(st), persist, syncPlayers };
       if (this._writing) return;
       this._writing = true;
 
       try {
         while (this._pendingGame) {
-          const snapshot = this._pendingGame;
+          const job = this._pendingGame;
           this._pendingGame = null;
+          const snapshot = job.snapshot;
 
           // Broadcast: everyone starts the same spin / phase instantly
           this.channel?.send({
@@ -1654,20 +1786,30 @@
             payload: snapshot,
           });
 
-          const { error } = await db().from("rooms").upsert({
-            code: this.code,
-            host_id: snapshot.hostId || st.hostId,
-            phase: snapshot.phase,
-            game: snapshot,
-            updated_at: new Date().toISOString(),
-          });
-          if (error) {
-            console.error("Room save failed:", error);
-            toast(error.message || "Failed to save room");
+          if (job.persist) {
+            const { error } = await db().from("rooms").upsert({
+              code: this.code,
+              host_id: snapshot.hostId || st.hostId,
+              phase: snapshot.phase,
+              game: snapshot,
+              updated_at: new Date().toISOString(),
+            });
+            if (error) {
+              console.error("Room save failed:", error);
+              toast(error.message || "Failed to save room");
+            }
           }
 
-          // Keep player scores in the players table (room-scoped)
-          await this.syncPlayerStats(st.players || []);
+          // Lobby roster already syncs via players-table realtime.
+          // Vote ticks never need player-row writes.
+          if (
+            job.persist &&
+            job.syncPlayers &&
+            snapshot.phase &&
+            snapshot.phase !== "lobby"
+          ) {
+            await this.syncPlayerStats(st.players || []);
+          }
         }
       } finally {
         this._writing = false;
@@ -1818,7 +1960,7 @@
       }
     }
 
-    broadcastState(st) {
+    broadcastState(st, _opts) {
       localStorage.setItem(this.storageKey, JSON.stringify(st));
       this.channel.postMessage({ type: "state", sourceId: me.id, state: st });
     }
@@ -1947,12 +2089,19 @@
     }
   }
 
-  function publish() {
+  function publish(opts) {
     if (!state) return Promise.resolve();
     saveSession();
     render();
-    if (me.isHost && sync) return Promise.resolve(sync.broadcastState(state));
+    if (me.isHost && sync) {
+      return Promise.resolve(sync.broadcastState(state, opts || {}));
+    }
     return Promise.resolve();
+  }
+
+  /** Vote-count ticks: live sync only — no DB rewrite storm. */
+  function publishVoteProgress() {
+    return publish({ persist: false, syncPlayers: false });
   }
 
   // ---------- TARGET mode (mid-game special round) ----------
@@ -2483,7 +2632,7 @@
     }
     if (state.wildcard.stage === "voting") {
       maybeResolveWildcardVotes();
-      if (state.wildcard?.stage === "voting") publish();
+      if (state.wildcard?.stage === "voting") publishVoteProgress();
     }
   }
 
@@ -2567,6 +2716,12 @@
         const existing = state.players.find((p) => p.id === action.player.id);
 
         if (existing) {
+          // Stale seat after a host boot — force a fresh approve flow
+          if (wasHostKicked(existing.id)) {
+            removePlayerFromState(existing.id);
+            enqueueJoinApproval(action);
+            break;
+          }
           // Same playerId reconnecting — restore seat, never duplicate
           const wasAway = existing.connected === false;
           const wantName = String(action.player.name || existing.name || "").trim();
@@ -2599,6 +2754,13 @@
             }
           }
           setPlayerConnected(existing.id, true);
+          // Lobby: roster syncs from the players table — don't republish game
+          // state (that re-renders every phone and rewrites player rows).
+          if (state.phase === "lobby") {
+            render();
+            if (wasAway) toast(`${existing.name} is back`);
+            return;
+          }
           publish();
           if (wasAway) toast(`${existing.name} is back`);
           return;
@@ -2621,40 +2783,10 @@
         }
 
         const newId = action.player.id;
-        if (reclaim) {
-          const restored = {
-            id: newId,
-            name: String(action.player.name || reclaim.name || "").trim(),
-            answered: reclaim.answered ?? 0,
-            skips: reclaim.skips ?? 0,
-            selections: reclaim.selections ?? 0,
-            kicked: !!reclaim.kicked,
-            isHost: false,
-            lateJoin: !!reclaim.lateJoin,
-            connected: true,
-            joinedAt: reclaim.joinedAt || Date.now(),
-            wildcardEligible: !!reclaim.wildcardEligible,
-            wildcardUsed: !!reclaim.wildcardUsed,
-          };
-          state.players.push(restored);
-          if (!state.selectionsById) state.selectionsById = {};
-          state.selectionsById[newId] = restored.selections;
-          setWildcardMeta(newId, {
-            eligible: restored.wildcardEligible,
-            used: restored.wildcardUsed,
-          });
-          setPlayerConnected(newId, true);
-          if (restored.lateJoin) markLateJoin(newId);
-          else if (state.lateJoinIds) {
-            state.lateJoinIds = state.lateJoinIds.filter((id) => id !== newId);
-          }
-          publish();
-          toast(`${restored.name} is back — progress restored`);
-          break;
-        }
 
-        // Mid-game link join — host must approve before they enter the roster
-        if (state.phase !== "lobby") {
+        // Mid-game seats + anyone the host previously removed need a yes first.
+        // Soft reconnect (already seated) is handled above.
+        if (joinNeedsHostApproval(newId)) {
           enqueueJoinApproval(action);
           break;
         }
@@ -2662,16 +2794,32 @@
         state.players.push({
           id: newId,
           name: String(action.player.name || "").trim(),
-          answered: 0,
-          skips: 0,
-          selections: 0,
+          answered: reclaim?.answered ?? 0,
+          skips: reclaim?.skips ?? 0,
+          selections: reclaim?.selections ?? 0,
           kicked: false,
           isHost: false,
           lateJoin: false,
           connected: true,
-          joinedAt: Date.now(),
+          joinedAt: reclaim?.joinedAt || Date.now(),
+          wildcardEligible: !!reclaim?.wildcardEligible,
+          wildcardUsed: !!reclaim?.wildcardUsed,
         });
+        if (reclaim) {
+          setWildcardMeta(newId, {
+            eligible: !!reclaim.wildcardEligible,
+            used: !!reclaim.wildcardUsed,
+          });
+          if (!state.selectionsById) state.selectionsById = {};
+          state.selectionsById[newId] = reclaim.selections ?? 0;
+        }
         setPlayerConnected(newId, true);
+        clearHostKicked(newId);
+        // Lobby joins already land in Supabase players — publish would flicker everyone
+        if (state.phase === "lobby") {
+          render();
+          break;
+        }
         publish();
         break;
       }
@@ -2679,6 +2827,11 @@
         const pid = action.playerId;
         if (!pid || !getPlayer(pid)) return;
         setPlayerConnected(pid, action.connected !== false);
+        // Presence flaps (tab focus) shouldn't rewrite the room during lobby
+        if (state.phase === "lobby") {
+          render();
+          break;
+        }
         publish();
         break;
       }
@@ -2820,6 +2973,7 @@
         const target = getPlayer(targetId);
         if (!target) return;
         const name = target.name;
+        markHostKicked(targetId);
         if (isTargetPhase()) {
           const broke = handleTargetLeaveDuringPlay(targetId);
           removePlayerFromState(targetId);
@@ -3033,8 +3187,9 @@
           (id) => hostWildcardVotes[id] === "yes" || hostWildcardVotes[id] === "no"
         ).length;
         maybeResolveWildcardVotes();
-        // If still voting, sync the cast count; result path already published
-        if (state.wildcard?.stage === "voting") publish();
+        // If still voting, sync the cast count live (no rooms/player rewrite);
+        // result path already published with full persist.
+        if (state.wildcard?.stage === "voting") publishVoteProgress();
         break;
       }
       default:
@@ -3682,13 +3837,13 @@
 
   function renderLobby() {
     updateHostRoomCode();
-    els.playerList.innerHTML = "";
-    state.players.forEach((p) => {
-      const li = document.createElement("li");
-      li.className = "player-pill";
-      if (p.isHost) li.classList.add("host");
-      if (p.id === me.id) li.classList.add("you");
-      if (p.connected === false) li.classList.add("away");
+    const list = els.playerList;
+    const players = state.players || [];
+    const seen = new Set();
+
+    players.forEach((p) => {
+      seen.add(p.id);
+      let li = list.querySelector(`li[data-player-id="${CSS.escape(p.id)}"]`);
       const meta =
         p.id === me.id
           ? "you"
@@ -3697,37 +3852,78 @@
             : p.isHost
               ? "host"
               : "joined";
-      li.innerHTML = `<span class="name">${escapeHtml(p.name)}</span><span class="meta">${meta}</span>`;
-      if (me.isHost && p.id !== me.id) {
-        const kick = document.createElement("button");
-        kick.type = "button";
-        kick.className = "btn-kick";
-        kick.textContent = "Remove";
-        kick.title = `Remove ${p.name}`;
-        kick.onclick = () => hostKickPlayer(p.id, p.name);
-        li.appendChild(kick);
+
+      if (!li) {
+        li = document.createElement("li");
+        li.className = "player-pill";
+        li.dataset.playerId = p.id;
+        li.innerHTML = `<span class="name"></span><span class="meta"></span>`;
+        list.appendChild(li);
       }
-      els.playerList.appendChild(li);
+
+      li.classList.toggle("host", !!p.isHost);
+      li.classList.toggle("you", p.id === me.id);
+      li.classList.toggle("away", p.connected === false);
+
+      const nameEl = li.querySelector(".name");
+      const metaEl = li.querySelector(".meta");
+      if (nameEl && nameEl.textContent !== p.name) {
+        nameEl.textContent = p.name;
+      }
+      if (metaEl && metaEl.textContent !== meta) {
+        metaEl.textContent = meta;
+      }
+
+      let kick = li.querySelector(".btn-kick");
+      if (me.isHost && p.id !== me.id) {
+        if (!kick) {
+          kick = document.createElement("button");
+          kick.type = "button";
+          kick.className = "btn-kick";
+          kick.textContent = "Remove";
+          kick.onclick = () => {
+            const id = li.dataset.playerId;
+            const pl = getPlayer(id);
+            if (pl) hostKickPlayer(pl.id, pl.name);
+          };
+          li.appendChild(kick);
+        }
+        kick.title = `Remove ${p.name}`;
+      } else if (kick) {
+        kick.remove();
+      }
+    });
+
+    [...list.querySelectorAll("li[data-player-id]")].forEach((li) => {
+      if (!seen.has(li.dataset.playerId)) li.remove();
     });
 
     const ready = activePlayers().length >= 2;
     const sub = document.querySelector("#screen-lobby .section-sub");
     if (sub) {
-      sub.textContent = me.isHost
+      const nextSub = me.isHost
         ? "Share the link. When everyone’s in, you start the game."
         : "You’re in. Wait for the host to start — only they can begin.";
+      if (sub.textContent !== nextSub) sub.textContent = nextSub;
     }
 
-    els.lobbyStatus.textContent = ready
+    const nextStatus = ready
       ? `${activePlayers().length} players ready`
       : "Waiting for players…";
-    els.lobbyHint.textContent = ready
+    if (els.lobbyStatus.textContent !== nextStatus) {
+      els.lobbyStatus.textContent = nextStatus;
+    }
+
+    const nextHint = ready
       ? me.isHost
         ? "You’re the host — open the question pool when everyone is in."
         : "Waiting for the host to start. You don’t need to do anything else yet."
       : me.isHost
         ? "Need at least 2 players to start."
         : "Waiting for more players… the host will start when ready.";
+    if (els.lobbyHint.textContent !== nextHint) {
+      els.lobbyHint.textContent = nextHint;
+    }
 
     els.btnStartQuestions.hidden = !me.isHost;
     els.btnStartQuestions.disabled = !ready || !me.isHost;
@@ -3748,16 +3944,7 @@
 
   function lobbyInviteUrl() {
     if (!state?.roomCode) return "";
-    let url = inviteUrl(state.roomCode);
-    try {
-      const params = new URLSearchParams(location.search);
-      if (params.get("local") === "1" || location.protocol === "file:") {
-        const u = new URL(url);
-        u.searchParams.set("local", "1");
-        url = u.toString();
-      }
-    } catch (_) {}
-    return url;
+    return inviteUrl(state.roomCode);
   }
 
   function updateLobbyQr() {
@@ -3783,16 +3970,20 @@
     const paint = () => {
       if (typeof QRCode === "undefined" || typeof QRCode.toCanvas !== "function") {
         // CDN fallback image if the library didn’t load
-        const img = block.querySelector("img.lobby-qr-fallback") || document.createElement("img");
-        img.className = "lobby-qr-fallback";
-        img.alt = "QR code to join this room";
-        img.width = 200;
-        img.height = 200;
-        img.src =
-          "https://api.qrserver.com/v1/create-qr-code/?size=200x200&margin=8&data=" +
-          encodeURIComponent(url);
         canvas.hidden = true;
-        if (!img.parentNode) block.insertBefore(img, canvas.nextSibling);
+        let img = block.querySelector("img.lobby-qr-fallback");
+        if (!img) {
+          img = document.createElement("img");
+          img.className = "lobby-qr-fallback";
+          img.alt = "QR code to join this room";
+          img.width = 180;
+          img.height = 180;
+          canvas.insertAdjacentElement("afterend", img);
+        }
+        img.hidden = false;
+        img.src =
+          "https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=8&data=" +
+          encodeURIComponent(url);
         return;
       }
       canvas.hidden = false;
@@ -3802,8 +3993,8 @@
         canvas,
         url,
         {
-          width: 200,
-          margin: 2,
+          width: 180,
+          margin: 1,
           color: { dark: "#1c1b19", light: "#ffffff" },
           errorCorrectionLevel: "M",
         },
@@ -4876,10 +5067,26 @@
     const name = subject?.name || "Player";
     const isSubject = me.id === w.playerId;
     const self = getPlayer(me.id);
+    const stageKey = `${w.stage}:${w.playerId}`;
+
+    let card = root.querySelector(".wildcard-card");
+    const sameStage = !!(card && card.dataset.wcStage === stageKey);
+
+    // Voting: patch progress / buttons in place — never rebuild (that restarts animation)
+    if (w.stage === "voting" && sameStage) {
+      patchWildcardVotingCard(card, w, name, isSubject, self);
+      return;
+    }
 
     root.innerHTML = "";
-    const card = document.createElement("div");
-    card.className = "wildcard-card";
+    card = document.createElement("div");
+    card.className = "wildcard-card is-enter";
+    card.dataset.wcStage = stageKey;
+    card.addEventListener(
+      "animationend",
+      () => card.classList.remove("is-enter"),
+      { once: true }
+    );
 
     if (w.stage === "intro") {
       card.innerHTML = `
@@ -4954,63 +5161,7 @@
     }
 
     if (w.stage === "voting") {
-      const voterIds = w.voterIds || [];
-      const castN =
-        typeof w.votedCount === "number"
-          ? w.votedCount
-          : Object.keys(w.votes || {}).length;
-      const totalN = voterIds.length;
-      const canVote = voterIds.includes(me.id) && !isSubject && self && !self.kicked;
-      const myVote = myWildcardVote || (w.votes || {})[me.id];
-
-      card.innerHTML = `
-        <p class="eyebrow">Anonymous vote</p>
-        <h2>Should ${escapeHtml(name)} return?</h2>
-        <p class="lead">${escapeHtml(name)} just confessed out loud. Majority yes brings them back — a tie keeps them out.</p>
-        <p class="wildcard-progress">${castN} / ${totalN} votes in · anonymous</p>
-      `;
-
-      if (isSubject) {
-        const note = document.createElement("p");
-        note.className = "lead";
-        note.textContent = "You can’t vote on your own return. Waiting…";
-        card.appendChild(note);
-      } else if (canVote) {
-        const row = document.createElement("div");
-        row.className = "wildcard-vote-row";
-        const yes = document.createElement("button");
-        yes.type = "button";
-        yes.className = "btn btn-primary btn-lg";
-        yes.textContent = myVote === "yes" ? "✓ LET THEM BACK IN" : "LET THEM BACK IN";
-        yes.onclick = () => {
-          myWildcardVote = "yes";
-          render();
-          send({ type: "wildcardVote", playerId: me.id, vote: "yes" });
-        };
-        const no = document.createElement("button");
-        no.type = "button";
-        no.className = "btn btn-danger btn-lg";
-        no.textContent = myVote === "no" ? "✓ KEEP THEM OUT" : "KEEP THEM OUT";
-        no.onclick = () => {
-          myWildcardVote = "no";
-          render();
-          send({ type: "wildcardVote", playerId: me.id, vote: "no" });
-        };
-        row.appendChild(yes);
-        row.appendChild(no);
-        card.appendChild(row);
-        if (myVote) {
-          const note = document.createElement("p");
-          note.className = "lead";
-          note.textContent = "Vote locked in. Waiting on everyone else…";
-          card.appendChild(note);
-        }
-      } else {
-        const note = document.createElement("p");
-        note.className = "lead";
-        note.textContent = "You’re spectating this vote.";
-        card.appendChild(note);
-      }
+      buildWildcardVotingCard(card, w, name, isSubject, self);
       root.appendChild(card);
       return;
     }
@@ -5033,6 +5184,110 @@
     }
 
     root.appendChild(card);
+  }
+
+  function wildcardVoteCounts(w) {
+    const voterIds = w.voterIds || [];
+    const castN =
+      typeof w.votedCount === "number"
+        ? w.votedCount
+        : Object.keys(w.votes || {}).length;
+    return { voterIds, castN, totalN: voterIds.length };
+  }
+
+  function buildWildcardVotingCard(card, w, name, isSubject, self) {
+    const { voterIds, castN, totalN } = wildcardVoteCounts(w);
+    const canVote = voterIds.includes(me.id) && !isSubject && self && !self.kicked;
+    const myVote = myWildcardVote || (w.votes || {})[me.id];
+
+    card.innerHTML = `
+      <p class="eyebrow">Anonymous vote</p>
+      <h2>Should ${escapeHtml(name)} return?</h2>
+      <p class="lead">${escapeHtml(name)} just confessed out loud. Majority yes brings them back — a tie keeps them out.</p>
+      <p class="wildcard-progress">${castN} / ${totalN} votes in · anonymous</p>
+    `;
+
+    if (isSubject) {
+      const note = document.createElement("p");
+      note.className = "lead";
+      note.dataset.wcNote = "subject";
+      note.textContent = "You can’t vote on your own return. Waiting…";
+      card.appendChild(note);
+      return;
+    }
+
+    if (canVote) {
+      const row = document.createElement("div");
+      row.className = "wildcard-vote-row";
+      const yes = document.createElement("button");
+      yes.type = "button";
+      yes.className = "btn btn-primary btn-lg";
+      yes.dataset.wcVote = "yes";
+      yes.textContent = myVote === "yes" ? "✓ LET THEM BACK IN" : "LET THEM BACK IN";
+      yes.onclick = () => {
+        myWildcardVote = "yes";
+        if (state?.wildcard) patchWildcardVotingCard(card, state.wildcard, name, isSubject, self);
+        send({ type: "wildcardVote", playerId: me.id, vote: "yes" });
+      };
+      const no = document.createElement("button");
+      no.type = "button";
+      no.className = "btn btn-danger btn-lg";
+      no.dataset.wcVote = "no";
+      no.textContent = myVote === "no" ? "✓ KEEP THEM OUT" : "KEEP THEM OUT";
+      no.onclick = () => {
+        myWildcardVote = "no";
+        if (state?.wildcard) patchWildcardVotingCard(card, state.wildcard, name, isSubject, self);
+        send({ type: "wildcardVote", playerId: me.id, vote: "no" });
+      };
+      row.appendChild(yes);
+      row.appendChild(no);
+      card.appendChild(row);
+      const note = document.createElement("p");
+      note.className = "lead";
+      note.dataset.wcNote = "voted";
+      note.hidden = !myVote;
+      note.textContent = "Vote locked in. Waiting on everyone else…";
+      card.appendChild(note);
+      return;
+    }
+
+    const note = document.createElement("p");
+    note.className = "lead";
+    note.dataset.wcNote = "spectate";
+    note.textContent = "You’re spectating this vote.";
+    card.appendChild(note);
+  }
+
+  function patchWildcardVotingCard(card, w, name, isSubject, self) {
+    const { castN, totalN } = wildcardVoteCounts(w);
+    const progress = card.querySelector(".wildcard-progress");
+    const nextProgress = `${castN} / ${totalN} votes in · anonymous`;
+    if (progress && progress.textContent !== nextProgress) {
+      progress.textContent = nextProgress;
+    }
+
+    const myVote = myWildcardVote || (w.votes || {})[me.id];
+    const yes = card.querySelector('[data-wc-vote="yes"]');
+    const no = card.querySelector('[data-wc-vote="no"]');
+    if (yes) {
+      const t = myVote === "yes" ? "✓ LET THEM BACK IN" : "LET THEM BACK IN";
+      if (yes.textContent !== t) yes.textContent = t;
+    }
+    if (no) {
+      const t = myVote === "no" ? "✓ KEEP THEM OUT" : "KEEP THEM OUT";
+      if (no.textContent !== t) no.textContent = t;
+    }
+    const votedNote = card.querySelector('[data-wc-note="voted"]');
+    if (votedNote) votedNote.hidden = !myVote;
+
+    // If the card was built before we became a voter (edge), rebuild once
+    const voterIds = w.voterIds || [];
+    const canVote = voterIds.includes(me.id) && !isSubject && self && !self.kicked;
+    const hasButtons = !!yes;
+    if (canVote && !hasButtons && !isSubject) {
+      card.innerHTML = "";
+      buildWildcardVotingCard(card, w, name, isSubject, self);
+    }
   }
 
   function renderFinals() {
@@ -5308,8 +5563,32 @@
   }
 
   // ---------- room bootstrap ----------
+  let playersApplyTimer = null;
+  let pendingPlayersPayload = null;
+
   function applyPlayers(players) {
+    // Batch rapid lobby inserts so five people joining doesn't paint five times
+    if (state?.phase === "lobby") {
+      pendingPlayersPayload = players;
+      if (playersApplyTimer) return;
+      playersApplyTimer = setTimeout(() => {
+        playersApplyTimer = null;
+        const next = pendingPlayersPayload;
+        pendingPlayersPayload = null;
+        applyPlayersNow(next);
+      }, 140);
+      return;
+    }
+    applyPlayersNow(players);
+  }
+
+  function applyPlayersNow(players) {
     let list = players || [];
+    // Never surface host-removed ids until the host admits them again
+    if (state && Array.isArray(state.hostKickedIds) && state.hostKickedIds.length) {
+      const banned = new Set(state.hostKickedIds);
+      list = list.filter((p) => !banned.has(p.id));
+    }
     // Mid-game: ignore DB rows the host hasn’t admitted yet
     if (
       state &&
@@ -5335,7 +5614,8 @@
       };
     }
     const newcomers = (list || []).filter((p) => !prevIds.has(p.id));
-    // Host: keep roster synced. lateJoin vs reclaim is decided by the join action.
+    // Host mid-game: seed selections for newly admitted players, then publish.
+    // Lobby: everyone already got the DB insert — local render only.
     if (me.isHost && newcomers.length && state.phase !== "end") {
       newcomers.forEach((p) => {
         if (!state.selectionsById) state.selectionsById = {};
@@ -5343,6 +5623,10 @@
           state.selectionsById[p.id] = getSelections(getPlayer(p.id) || p);
         }
       });
+      if (state.phase === "lobby") {
+        render();
+        return;
+      }
       publish();
     } else {
       render();
@@ -5351,6 +5635,25 @@
 
   function applyGameState(st) {
     const players = state?.players || st.players || [];
+    const prev = state?.wildcard;
+    const next = st?.wildcard;
+    // Skip no-op re-applies (broadcast + rooms echo used to double-paint votes)
+    if (
+      state &&
+      st?.phase === "wildcard" &&
+      state.phase === "wildcard" &&
+      prev &&
+      next &&
+      prev.stage === next.stage &&
+      prev.playerId === next.playerId &&
+      prev.votedCount === next.votedCount &&
+      prev.result === next.result &&
+      prev.yesCount === next.yesCount &&
+      prev.noCount === next.noCount &&
+      prev.tied === next.tied
+    ) {
+      return;
+    }
     state = mergeGameIntoState(st, players);
     syncHostRole();
     render();
@@ -5405,21 +5708,13 @@
         sync = new LocalSync(code, true);
         attachSyncHandlers();
         await sync.start();
-        const url = new URL(location.href);
-        url.searchParams.set("room", code);
-        url.searchParams.set("local", "1");
-        history.replaceState(null, "", url);
+        setGameLocation(code, { local: true });
       } else {
         throw err;
       }
     }
 
-    const url = new URL(location.href);
-    url.searchParams.set("room", code);
-    url.searchParams.delete("host");
-    if (preferLocal) url.searchParams.set("local", "1");
-    else url.searchParams.delete("local");
-    history.replaceState(null, "", url);
+    setGameLocation(code, { local: !!preferLocal });
 
     await publish();
     showScreen("lobby");
@@ -5532,17 +5827,20 @@
               return;
             }
             const alreadyInRoom = (st.players || []).some((p) => p.id === me.id);
-            const needsApproval =
-              st.phase !== "lobby" && !alreadyInRoom && !reclaimPayload;
+            const needsApproval = joinNeedsHostApproval(me.id, st);
             if (needsApproval) {
               awaitingJoinApproval = true;
-              showJoinWait();
+              showJoinWait(
+                wasHostKicked(me.id, st)
+                  ? "You were removed from this room. Waiting for the host to let you back in."
+                  : "You asked to join mid-game. The host will choose whether to let you in."
+              );
             }
             send(joinMessage());
-            if (reclaimPayload) {
+            if (!needsApproval && reclaimPayload) {
               clearReclaim(code);
               toast("Welcome back — your progress is restored");
-            } else if (alreadyInRoom) {
+            } else if (!needsApproval && alreadyInRoom) {
               toast("Reconnected");
             } else if (!needsApproval && st.phase !== "lobby") {
               toast("Joined mid-game — you’ll play with the existing question pool");
@@ -5629,7 +5927,15 @@
 
         const players = state.players || [];
         const meRow = players.find((p) => p.id === me.id);
-        const alreadyInRoom = !!meRow;
+        // A host-kicked id must never auto-reclaim a leftover DB row
+        if (meRow && wasHostKicked(me.id, state)) {
+          try {
+            await sync.deletePlayer?.(me.id);
+          } catch (_) {}
+          state.players = players.filter((p) => p.id !== me.id);
+        }
+        const alreadyInRoom =
+          !!meRow && !wasHostKicked(me.id, state);
 
         if (
           !alreadyInRoom &&
@@ -5640,19 +5946,20 @@
           );
         }
 
-        if (meRow) {
+        if (alreadyInRoom && meRow) {
           me.isHost = !!meRow.isHost;
           sync.isHost = me.isHost;
         }
 
-        const needsApproval =
-          !alreadyInRoom &&
-          !reclaimPayload &&
-          state.phase !== "lobby";
+        const needsApproval = joinNeedsHostApproval(me.id, state);
 
         if (needsApproval) {
           awaitingJoinApproval = true;
-          showJoinWait();
+          showJoinWait(
+            wasHostKicked(me.id, state)
+              ? "You were removed from this room. Waiting for the host to let you back in."
+              : "You asked to join mid-game. The host will choose whether to let you in."
+          );
           send(joinMessage());
         } else {
           if (!alreadyInRoom) {
@@ -5664,20 +5971,15 @@
         restoreMyLocalQuestionsFromState();
         if (me.isHost) recoverHostProgress();
         render();
-        if (reclaimPayload) {
+        if (!needsApproval && reclaimPayload) {
           clearReclaim(code);
           toast("Welcome back — your progress is restored");
-        } else if (alreadyInRoom && !resumeId) {
+        } else if (!needsApproval && alreadyInRoom && !resumeId) {
           toast("Reconnected");
         }
       }
 
-      const url = new URL(location.href);
-      url.searchParams.set("room", code);
-      url.searchParams.delete("host");
-      if (preferLocal) url.searchParams.set("local", "1");
-      else url.searchParams.delete("local");
-      history.replaceState(null, "", url);
+      setGameLocation(code, { local: !!preferLocal });
       if (!awaitingJoinApproval) saveSession();
     } catch (err) {
       hideJoinWait();
