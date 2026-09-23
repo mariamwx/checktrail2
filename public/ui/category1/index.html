@@ -59,12 +59,17 @@
             <input id="player-name" type="text" maxlength="18" placeholder="What should we call you?" autocomplete="nickname" required />
           </label>
 
+          <label class="field">
+            <span>Room code</span>
+            <input id="room-code" type="text" maxlength="6" placeholder="Optional" class="room-input" autocomplete="off" inputmode="text" spellcheck="false" />
+          </label>
+
           <div class="home-actions">
-            <button type="submit" class="btn btn-primary" id="btn-create">Create room</button>
-            <div class="join-row">
-              <input id="room-code" type="text" maxlength="6" placeholder="ROOM" class="room-input" autocomplete="off" />
-              <button type="button" class="btn btn-ghost" id="btn-join">Join</button>
-            </div>
+            <p class="home-action-hint" id="home-action-hint">Starting a new room</p>
+            <button type="submit" class="btn btn-primary" id="btn-home-primary">Create room</button>
+            <button type="button" class="invite-own-group" id="btn-start-own-group" hidden>
+              start your own group
+            </button>
           </div>
         </form>
         <p id="home-error" class="error-msg" hidden></p>
@@ -96,6 +101,12 @@
           <p class="hint" id="lobby-hint">Need at least 2 players to start.</p>
           <button type="button" class="btn btn-ghost" id="btn-leave-lobby">Leave room</button>
         </aside>
+      </div>
+
+      <div id="lobby-qr-block" class="lobby-qr-block" hidden>
+        <p class="lobby-qr-label">Scan to join</p>
+        <canvas id="lobby-qr-canvas" width="200" height="200" aria-label="QR code to join this room"></canvas>
+        <p class="lobby-qr-hint">Pass this phone around — friends scan with their camera</p>
       </div>
     </section>
 
@@ -173,6 +184,7 @@
         <p class="brand-sm">Icebreaker</p>
         <p class="target-tag">TARGET</p>
       </header>
+      <ul id="target-host-kick-list" class="host-kick-list target-host-kick" hidden></ul>
       <div class="target-stage" id="target-stage">
         <!-- filled by JS -->
       </div>
@@ -196,9 +208,11 @@
         <p class="finals-tag">Rapid Fire</p>
       </header>
 
+      <p class="finals-role" id="finals-role" hidden></p>
+
       <div class="finals-layout">
         <div class="finals-scoreboard">
-          <div class="finals-side finals-side-a">
+          <div class="finals-side finals-side-a" id="finals-side-a">
             <span class="buzzer-name" id="finalist-a-name">—</span>
             <span class="buzzer-score" id="finalist-a-score">0</span>
           </div>
@@ -206,7 +220,7 @@
             <p class="vs">VS</p>
             <p class="finals-timer" id="finals-timer">—</p>
           </div>
-          <div class="finals-side finals-side-b">
+          <div class="finals-side finals-side-b" id="finals-side-b">
             <span class="buzzer-name" id="finalist-b-name">—</span>
             <span class="buzzer-score" id="finalist-b-score">0</span>
           </div>
@@ -217,7 +231,7 @@
           <p class="finals-question" id="finals-question">Waiting for the host to start…</p>
         </div>
 
-        <div class="giant-buzzer-wrap">
+        <div class="giant-buzzer-wrap" id="buzzer-wrap">
           <button type="button" class="giant-buzzer" id="buzzer-main" disabled aria-label="Buzz in">
             <span class="giant-buzzer-base" aria-hidden="true"></span>
             <span class="giant-buzzer-dome">
@@ -264,6 +278,17 @@
         <button type="button" class="btn btn-primary" id="btn-play-again">Back to home</button>
       </div>
     </section>
+
+    <!-- JOIN WAITING (mid-game, awaiting host) -->
+    <div id="join-wait-overlay" class="overlay" hidden>
+      <div class="overlay-card">
+        <p class="confirm-eyebrow">Hang tight</p>
+        <h2>Waiting on the host</h2>
+        <p class="confirm-message" id="join-wait-message">
+          You asked to join mid-game. The host will choose whether to let you in.
+        </p>
+      </div>
+    </div>
 
     <!-- KICKED OVERLAY -->
     <div id="kicked-overlay" class="overlay" hidden>
@@ -315,6 +340,7 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
   <script src="/logic/supabase-config.js"></script>
   <script src="/logic/category1.js"></script>
 </body>

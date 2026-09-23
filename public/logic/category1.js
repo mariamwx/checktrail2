@@ -52,12 +52,15 @@
     homeForm: $("#home-form"),
     playerName: $("#player-name"),
     roomCode: $("#room-code"),
-    btnCreate: $("#btn-create"),
-    btnJoin: $("#btn-join"),
+    btnHomePrimary: $("#btn-home-primary"),
+    homeActionHint: $("#home-action-hint"),
+    btnStartOwnGroup: $("#btn-start-own-group"),
     homeError: $("#home-error"),
     lobbyCode: $("#lobby-code"),
     lobbyRoomChip: $("#lobby-room-chip"),
     btnCopyLink: $("#btn-copy-link"),
+    lobbyQrBlock: $("#lobby-qr-block"),
+    lobbyQrCanvas: $("#lobby-qr-canvas"),
     hostRoomCode: $("#host-room-code"),
     hostRoomCodeValue: $("#host-room-code-value"),
     playerList: $("#player-list"),
@@ -108,7 +111,14 @@
     confirmCancel: $("#confirm-cancel"),
     confirmOk: $("#confirm-ok"),
     targetStage: $("#target-stage"),
+    targetHostKickList: $("#target-host-kick-list"),
     wildcardStage: $("#wildcard-stage"),
+    finalsRole: $("#finals-role"),
+    finalsSideA: $("#finals-side-a"),
+    finalsSideB: $("#finals-side-b"),
+    screenFinals: $("#screen-finals"),
+    joinWaitOverlay: $("#join-wait-overlay"),
+    joinWaitMessage: $("#join-wait-message"),
   };
 
   // Editorial palette — matches iso-theme guy accents
@@ -147,6 +157,8 @@
    * the shared game blob as identifiable choices — only votedCount/result sync.
    */
   let hostWildcardVotes = {};
+  /** Local-only TARGET setup draft so other players locking in doesn’t wipe the form. */
+  let targetSetupDraft = { text: "", targetId: null };
 
   /** Circular idea reel for the question pool screen */
   const IDEA_BANK = [
@@ -259,6 +271,29 @@
   }
 
   const ACTIVE_ROOM_KEY = "c1-active-room";
+  /** Stable browser identity — NOT the display name. Survives refresh / back / tab close. */
+  const PLAYER_ID_KEY = "c1-player-id";
+
+  function uid() {
+    if (typeof crypto !== "undefined" && crypto.randomUUID) {
+      return crypto.randomUUID();
+    }
+    return `p_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  /** One identity per browser until localStorage is cleared. */
+  function getPersistentPlayerId() {
+    try {
+      let id = localStorage.getItem(PLAYER_ID_KEY);
+      if (!id || typeof id !== "string" || id.length < 8) {
+        id = uid();
+        localStorage.setItem(PLAYER_ID_KEY, id);
+      }
+      return id;
+    } catch (_) {
+      return uid();
+    }
+  }
 
   function saveSession() {
     if (!me?.id || !state?.roomCode) return;
@@ -272,6 +307,8 @@
       };
       localStorage.setItem(sessionKey(state.roomCode), JSON.stringify(payload));
       localStorage.setItem(ACTIVE_ROOM_KEY, String(state.roomCode).toUpperCase());
+      // Keep browser identity aligned with the seat we're playing as
+      localStorage.setItem(PLAYER_ID_KEY, me.id);
     } catch (_) {}
   }
 
@@ -302,9 +339,9 @@
     } catch (_) {}
   }
 
-  /** Same device + same name can reclaim progress after Leave room. */
+  /** Same browser can reclaim progress after an explicit Leave room. Matched by playerId. */
   function saveReclaim(code, payload) {
-    if (!code || !payload?.id || !payload?.name) return;
+    if (!code || !payload?.id) return;
     try {
       localStorage.setItem(
         reclaimKey(code),
@@ -570,10 +607,6 @@
   }
 
   // ---------- utils ----------
-  function uid() {
-    return Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
-  }
-
   function roomCode() {
     const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let out = "";
@@ -658,6 +691,8 @@
   }
 
   function handleNameTaken(message) {
+    hideJoinWait();
+    awaitingJoinApproval = false;
     const msg =
       message || "That name is already taken in this room. Pick another.";
     const code = sync?.code || state?.roomCode || els.roomCode?.value?.trim();
@@ -672,10 +707,169 @@
     updateHostRoomCode();
     if (code && typeof enableInviteHome === "function") enableInviteHome(code);
     toast(msg);
-    if (els.btnJoin) els.btnJoin.disabled = false;
+    if (els.btnHomePrimary) els.btnHomePrimary.disabled = false;
+  }
+
+  function handleJoinDenied(message) {
+    handleNameTaken(
+      message || "The host didn’t let you into this game."
+    );
+  }
+
+  function handleJoinAccepted() {
+    if (!awaitingJoinApproval) return;
+    awaitingJoinApproval = false;
+    hideJoinWait();
+    saveSession();
+    toast("You’re in — you’ll play with the existing question pool");
+    render();
+  }
+
+  function showJoinWait(message) {
+    if (els.joinWaitMessage && message) {
+      els.joinWaitMessage.textContent = message;
+    }
+    if (els.joinWaitOverlay) els.joinWaitOverlay.hidden = false;
+  }
+
+  function hideJoinWait() {
+    if (els.joinWaitOverlay) els.joinWaitOverlay.hidden = true;
+  }
+
+  let awaitingJoinApproval = false;
+  let joinApprovalQueue = [];
+  let joinApprovalBusy = false;
+
+  function enqueueJoinApproval(action) {
+    const id = action?.player?.id;
+    if (!id || !state) return;
+    if (state.players.some((p) => p.id === id)) return;
+    if (joinApprovalQueue.some((a) => a?.player?.id === id)) return;
+    joinApprovalQueue.push(action);
+    processJoinApprovalQueue();
+  }
+
+  async function processJoinApprovalQueue() {
+    if (joinApprovalBusy || !me.isHost) return;
+    joinApprovalBusy = true;
+    while (joinApprovalQueue.length && me.isHost && state) {
+      const next = joinApprovalQueue.shift();
+      await promptAdmitJoiner(next);
+    }
+    joinApprovalBusy = false;
+  }
+
+  async function promptAdmitJoiner(action) {
+    const id = action?.player?.id;
+    const name = String(action?.player?.name || "Someone").trim();
+    if (!id || !state || !me.isHost) return;
+
+    if (state.players.some((p) => p.id === id)) return;
+
+    if (state.phase === "end") {
+      sync?.notifyJoinRejected?.({
+        playerId: id,
+        reason: "ended",
+        message: "This game already ended.",
+      });
+      return;
+    }
+    if (isTargetPhase()) {
+      sync?.notifyJoinRejected?.({
+        playerId: id,
+        reason: "target_lock",
+        message:
+          "TARGET is currently in progress. You can join when the round is over.",
+      });
+      return;
+    }
+    if (
+      state.players.some(
+        (p) => p.name.toLowerCase() === name.toLowerCase()
+      )
+    ) {
+      sync?.notifyJoinRejected?.({
+        playerId: id,
+        reason: "name_taken",
+        message: "That name is already taken in this room. Pick another.",
+      });
+      return;
+    }
+
+    const ok = await showConfirm({
+      eyebrow: "Join request",
+      title: `Let ${name} in?`,
+      message: `${name} wants to join mid-game from the invite link. They’ll use the existing question pool.`,
+      cancelLabel: "Keep out",
+      okLabel: "Let in",
+      danger: false,
+    });
+
+    if (!state || !me.isHost) return;
+
+    if (!ok) {
+      sync?.notifyJoinRejected?.({
+        playerId: id,
+        reason: "denied",
+        message: "The host didn’t let you into this game.",
+      });
+      return;
+    }
+
+    if (state.players.some((p) => p.id === id)) {
+      sync?.notifyJoinAccepted?.({ playerId: id });
+      return;
+    }
+    if (
+      state.players.some(
+        (p) => p.name.toLowerCase() === name.toLowerCase()
+      )
+    ) {
+      sync?.notifyJoinRejected?.({
+        playerId: id,
+        reason: "name_taken",
+        message: "That name is already taken in this room. Pick another.",
+      });
+      return;
+    }
+
+    state.players.push({
+      id,
+      name,
+      answered: 0,
+      skips: 0,
+      selections: 0,
+      kicked: false,
+      isHost: false,
+      lateJoin: true,
+      connected: true,
+      joinedAt: Date.now(),
+    });
+    markLateJoin(id);
+    setPlayerConnected(id, true);
+    if (!state.selectionsById) state.selectionsById = {};
+    state.selectionsById[id] = 0;
+    publish();
+    sync?.notifyJoinAccepted?.({ playerId: id });
+    try {
+      await sync?.addPlayer?.({
+        id,
+        name,
+        answered: 0,
+        skips: 0,
+        selections: 0,
+        kicked: false,
+        isHost: false,
+      });
+    } catch (err) {
+      console.error("Failed to persist mid-game joiner:", err);
+    }
+    toast(`${name} joined mid-game`);
   }
 
   function handleKickedOut(message) {
+    hideJoinWait();
+    awaitingJoinApproval = false;
     const msg = message || "The host removed you from the room.";
     const code = sync?.code || state?.roomCode;
     try {
@@ -797,9 +991,28 @@
     if (p) p.lateJoin = true;
   }
 
+  function setPlayerConnected(playerId, connected, st = state) {
+    if (!st || !playerId) return;
+    if (!st.connectedById) st.connectedById = {};
+    st.connectedById[playerId] = !!connected;
+    const p = getPlayer(playerId, st);
+    if (p) p.connected = !!connected;
+  }
+
+  function isPlayerConnected(playerId, st = state) {
+    if (!st || !playerId) return false;
+    if (st.connectedById && playerId in st.connectedById) {
+      return !!st.connectedById[playerId];
+    }
+    const p = getPlayer(playerId, st);
+    if (p && typeof p.connected === "boolean") return p.connected;
+    return true; // legacy seats default online
+  }
+
   function hydratePlayerStats(players, st = state) {
     const map = st?.selectionsById || {};
     const wcMap = st?.wildcardById || {};
+    const connMap = st?.connectedById || {};
     const prevById = Object.fromEntries((st?.players || []).map((p) => [p.id, p]));
     // Prefer the live room roster so lateJoin survives game-only broadcasts
     const liveById = Object.fromEntries((state?.players || []).map((p) => [p.id, p]));
@@ -812,12 +1025,17 @@
         lateIds.has(p.id)
       );
       const wc = wcMap[p.id] || {};
+      let connected = true;
+      if (p.id in connMap) connected = !!connMap[p.id];
+      else if (typeof p.connected === "boolean") connected = p.connected;
+      else if (typeof prev?.connected === "boolean") connected = prev.connected;
       return {
         ...p,
         selections: map[p.id] ?? p.selections ?? 0,
         skips: p.skips ?? 0,
         answered: p.answered ?? 0,
         lateJoin,
+        connected,
         joinedAt: p.joinedAt ?? prev?.joinedAt ?? 0,
         isHost: !!(st?.hostId ? p.id === st.hostId : p.isHost || prev?.isHost),
         wildcardEligible: !!(
@@ -870,6 +1088,9 @@
     if (st.wildcardById && playerId in st.wildcardById) {
       delete st.wildcardById[playerId];
     }
+    if (st.connectedById && playerId in st.connectedById) {
+      delete st.connectedById[playerId];
+    }
     if (Array.isArray(st.lateJoinIds)) {
       st.lateJoinIds = st.lateJoinIds.filter((id) => id !== playerId);
     }
@@ -913,6 +1134,7 @@
         const other = getPlayer(otherId);
         if (other && !other.kicked) {
           state.winnerId = otherId;
+          state.winnerName = other.name || null;
           state.revealForId = pickAuthorRevealId();
           state.phase = "end";
           state.finals = null;
@@ -988,9 +1210,11 @@
       wildcard,
       wildcardQueue,
       wildcardById,
+      connectedById,
       winnerId,
       revealForId,
       finalsAnswerScores,
+      winnerName,
       _finalistAId,
       _finalistBId,
     } = st;
@@ -1033,7 +1257,9 @@
         : null,
       wildcardQueue: Array.isArray(wildcardQueue) ? wildcardQueue : [],
       wildcardById: wildcardById || {},
+      connectedById: connectedById || {},
       winnerId,
+      winnerName: winnerName || null,
       revealForId,
       finalsAnswerScores: finalsAnswerScores || null,
       _finalistAId,
@@ -1058,11 +1284,18 @@
 
   // ---------- state factory ----------
   function createState(code, hostPlayer) {
+    const hostId = hostPlayer.id;
     return {
       phase: "lobby",
       roomCode: code,
-      hostId: hostPlayer.id,
-      players: [{ ...hostPlayer, joinedAt: hostPlayer.joinedAt || Date.now() }],
+      hostId,
+      players: [
+        {
+          ...hostPlayer,
+          connected: true,
+          joinedAt: hostPlayer.joinedAt || Date.now(),
+        },
+      ],
       questions: [],
       questionEndsAt: null,
       answerEndsAt: null,
@@ -1076,12 +1309,14 @@
       poolMinQuestions: 0,
       questionsLocked: false,
       lateJoinIds: [],
+      connectedById: { [hostId]: true },
       finals: null,
       target: null,
       wildcard: null,
       wildcardQueue: [],
       wildcardById: {},
       winnerId: null,
+      winnerName: null,
       revealForId: null,
       finalsAnswerScores: null,
     };
@@ -1118,6 +1353,13 @@
 
     /** Step 7 — add a player into this room only */
     async addPlayer(player) {
+      // player.id is a browser-persistent identity and the table PK —
+      // clear any leftover seat in a different room before upserting here.
+      await db()
+        .from("players")
+        .delete()
+        .eq("id", player.id)
+        .neq("room_id", this.code);
       const { error } = await db().from("players").upsert(
         {
           id: player.id,
@@ -1173,7 +1415,12 @@
       return data;
     }
 
-    async start({ hostPlayer = null, joinPlayer = null, resume = false } = {}) {
+    async start({
+      hostPlayer = null,
+      joinPlayer = null,
+      resume = false,
+      deferPlayerAdd = false,
+    } = {}) {
       if (!supabaseClient) {
         throw new Error("Supabase client failed to load. Check your connection and config.");
       }
@@ -1208,7 +1455,7 @@
       } else {
         const room = await this.fetchRoom();
         if (!room) {
-          throw new Error("Room not found. Check the code / link (?room=ABC123).");
+          throw new Error("Room not found");
         }
         const players = await this.fetchPlayers();
         const game = room.game && typeof room.game === "object" ? room.game : {};
@@ -1247,7 +1494,7 @@
               "That name is already taken in this room. Pick another."
             );
           }
-          if (!alreadyIn) {
+          if (!alreadyIn && !deferPlayerAdd) {
             await this.addPlayer(joinPlayer);
           }
         }
@@ -1317,7 +1564,12 @@
         })
         .on("broadcast", { event: "joinRejected" }, ({ payload }) => {
           if (payload?.playerId === me.id) {
-            handleNameTaken(payload.message);
+            handleJoinDenied(payload.message);
+          }
+        })
+        .on("broadcast", { event: "joinAccepted" }, ({ payload }) => {
+          if (payload?.playerId === me.id) {
+            handleJoinAccepted(payload);
           }
         })
         .on("broadcast", { event: "questionRejected" }, ({ payload }) => {
@@ -1460,6 +1712,14 @@
       });
     }
 
+    notifyJoinAccepted(payload) {
+      this.channel?.send({
+        type: "broadcast",
+        event: "joinAccepted",
+        payload,
+      });
+    }
+
     notifyQuestionRejected(payload) {
       this.channel?.send({
         type: "broadcast",
@@ -1525,7 +1785,10 @@
         this.broadcastState(state);
       }
       if (msg.type === "joinRejected" && msg.payload?.playerId === me.id) {
-        handleNameTaken(msg.payload.message);
+        handleJoinDenied(msg.payload.message);
+      }
+      if (msg.type === "joinAccepted" && msg.payload?.playerId === me.id) {
+        handleJoinAccepted(msg.payload);
       }
       if (msg.type === "questionRejected" && msg.payload?.playerId === me.id) {
         handleQuestionRejected(msg.payload.message);
@@ -1570,6 +1833,14 @@
 
     notifyJoinRejected(payload) {
       this.channel.postMessage({ type: "joinRejected", sourceId: me.id, payload });
+    }
+
+    notifyJoinAccepted(payload) {
+      this.channel.postMessage({
+        type: "joinAccepted",
+        sourceId: me.id,
+        payload,
+      });
     }
 
     notifyQuestionRejected(payload) {
@@ -1726,23 +1997,38 @@
     return t.chain[t.chainIndex] || null;
   }
 
-  function canStartTarget() {
-    if (!me.isHost || !state) return false;
+  /**
+   * TARGET is a mid-wheel special — host only, and only after Mode 1
+   * (random wheel) is underway. Never offered in lobby / question pool /
+   * on the opening spin before anyone has answered or skipped.
+   */
+  function canHostLaunchTarget(st = state) {
+    if (!st) return false;
+    if (isTargetPhase(st) || isWildcardPhase(st)) return false;
     if (
-      isTargetPhase() ||
-      isWildcardPhase() ||
-      state.phase === "lobby" ||
-      state.phase === "questions" ||
-      state.phase === "finals" ||
-      state.phase === "end"
+      st.phase === "lobby" ||
+      st.phase === "questions" ||
+      st.phase === "finals" ||
+      st.phase === "end"
     ) {
       return false;
     }
-    // Only during the wheel game — not while filling the question pool
-    if (!["spinning", "answering", "confirm"].includes(state.phase)) {
+    // Random wheel game only
+    if (!["spinning", "answering", "confirm"].includes(st.phase)) {
       return false;
     }
-    return activePlayers().length >= TARGET_MIN_PLAYERS;
+    // Pool must be locked (wheel has actually started)
+    if (!st.questionsLocked) return false;
+    // Not on the very first turn — wait until someone has answered or skipped
+    const wheelUnderway = (st.players || []).some(
+      (p) => (p.answered || 0) > 0 || (p.skips || 0) > 0
+    );
+    if (!wheelUnderway) return false;
+    return activePlayers(st).length >= TARGET_MIN_PLAYERS;
+  }
+
+  function canStartTarget() {
+    return !!(me.isHost && canHostLaunchTarget());
   }
 
   function beginTargetRound() {
@@ -1752,6 +2038,7 @@
       return;
     }
     clearAnswerTimers();
+    targetSetupDraft = { text: "", targetId: null };
     const resumePhase = state.phase;
     state.target = {
       stage: "intro",
@@ -2280,45 +2567,49 @@
         const existing = state.players.find((p) => p.id === action.player.id);
 
         if (existing) {
+          // Same playerId reconnecting — restore seat, never duplicate
+          const wasAway = existing.connected === false;
+          const wantName = String(action.player.name || existing.name || "").trim();
+          if (
+            wantName &&
+            wantName.toLowerCase() !== String(existing.name || "").toLowerCase()
+          ) {
+            const nameTaken = state.players.some(
+              (p) =>
+                p.id !== existing.id &&
+                p.name.toLowerCase() === wantName.toLowerCase()
+            );
+            if (nameTaken) {
+              sync?.notifyJoinRejected?.({
+                playerId: existing.id,
+                reason: "name_taken",
+                message: "That name is already taken in this room. Pick another.",
+              });
+              return;
+            }
+            existing.name = wantName;
+          }
           if (reclaim) {
-            // Same device/name coming back — restore their seat stats
-            existing.name = String(action.player.name || existing.name || "").trim();
-            existing.answered = reclaim.answered ?? existing.answered ?? 0;
-            existing.skips = reclaim.skips ?? existing.skips ?? 0;
-            existing.kicked = !!reclaim.kicked;
-            existing.lateJoin = !!reclaim.lateJoin;
-            existing.joinedAt = reclaim.joinedAt || existing.joinedAt || Date.now();
-            setSelections(existing, reclaim.selections ?? getSelections(existing));
-            setWildcardMeta(existing.id, {
-              eligible: !!reclaim.wildcardEligible,
-              used: !!reclaim.wildcardUsed,
-            });
-            if (existing.lateJoin) markLateJoin(existing.id);
-            else if (state.lateJoinIds) {
-              state.lateJoinIds = state.lateJoinIds.filter((id) => id !== existing.id);
+            // Prefer live room stats; only fill gaps from reclaim snapshot
+            if (existing.answered == null && reclaim.answered != null) {
+              existing.answered = reclaim.answered;
             }
-            publish();
-            toast(`${existing.name} is back — progress restored`);
-            return;
-          }
-          // Fresh mid-game face (Supabase already inserted the row)
-          if (state.phase !== "lobby" && !existing.lateJoin) {
-            markLateJoin(existing.id);
-            if (!state.selectionsById) state.selectionsById = {};
-            if (!(existing.id in state.selectionsById)) {
-              state.selectionsById[existing.id] = 0;
+            if (existing.skips == null && reclaim.skips != null) {
+              existing.skips = reclaim.skips;
             }
-            publish();
-            toast(`${existing.name} joined mid-game`);
           }
+          setPlayerConnected(existing.id, true);
+          publish();
+          if (wasAway) toast(`${existing.name} is back`);
           return;
         }
 
         if (
           state.players.some(
             (p) =>
+              p.id !== action.player.id &&
               p.name.toLowerCase() ===
-              String(action.player.name || "").trim().toLowerCase()
+                String(action.player.name || "").trim().toLowerCase()
           )
         ) {
           sync?.notifyJoinRejected?.({
@@ -2340,6 +2631,7 @@
             kicked: !!reclaim.kicked,
             isHost: false,
             lateJoin: !!reclaim.lateJoin,
+            connected: true,
             joinedAt: reclaim.joinedAt || Date.now(),
             wildcardEligible: !!reclaim.wildcardEligible,
             wildcardUsed: !!reclaim.wildcardUsed,
@@ -2351,6 +2643,7 @@
             eligible: restored.wildcardEligible,
             used: restored.wildcardUsed,
           });
+          setPlayerConnected(newId, true);
           if (restored.lateJoin) markLateJoin(newId);
           else if (state.lateJoinIds) {
             state.lateJoinIds = state.lateJoinIds.filter((id) => id !== newId);
@@ -2360,7 +2653,12 @@
           break;
         }
 
-        const lateJoin = state.phase !== "lobby";
+        // Mid-game link join — host must approve before they enter the roster
+        if (state.phase !== "lobby") {
+          enqueueJoinApproval(action);
+          break;
+        }
+
         state.players.push({
           id: newId,
           name: String(action.player.name || "").trim(),
@@ -2369,18 +2667,19 @@
           selections: 0,
           kicked: false,
           isHost: false,
-          lateJoin,
+          lateJoin: false,
+          connected: true,
           joinedAt: Date.now(),
         });
-        if (lateJoin) {
-          markLateJoin(newId);
-          if (!state.selectionsById) state.selectionsById = {};
-          state.selectionsById[newId] = 0;
-        }
+        setPlayerConnected(newId, true);
         publish();
-        if (lateJoin) {
-          toast(`${String(action.player.name || "").trim()} joined mid-game`);
-        }
+        break;
+      }
+      case "presence": {
+        const pid = action.playerId;
+        if (!pid || !getPlayer(pid)) return;
+        setPlayerConnected(pid, action.connected !== false);
+        publish();
         break;
       }
       case "leave": {
@@ -2608,8 +2907,9 @@
         break;
       }
       case "startTarget": {
+        // Host only — and only mid wheel-game (see canHostLaunchTarget)
         if (action.playerId !== state.hostId) return;
-        if (!canStartTarget()) return;
+        if (!canHostLaunchTarget()) return;
         beginTargetRound();
         break;
       }
@@ -2946,6 +3246,7 @@
       state.revealForId = pickAuthorRevealId(all);
       state.phase = "end";
       state.winnerId = state.revealForId;
+      state.winnerName = getPlayer(state.winnerId)?.name || null;
       publish();
       return;
     }
@@ -2954,6 +3255,7 @@
       // Sole survivor — no buzzer match
       state.phase = "end";
       state.winnerId = candidates[0].id;
+      state.winnerName = candidates[0].name || null;
       state.revealForId = pickAuthorRevealId(all);
       publish();
       return;
@@ -3047,21 +3349,61 @@
     // Game winner = who buzzed in and answered the most in rapid fire
     let winnerId = null;
     if (f) {
-      if (f.aScore > f.bScore) winnerId = f.aId;
-      else if (f.bScore > f.aScore) winnerId = f.bId;
+      const aScore = Number(f.aScore) || 0;
+      const bScore = Number(f.bScore) || 0;
+      f.aScore = aScore;
+      f.bScore = bScore;
+      if (aScore > bScore) winnerId = f.aId;
+      else if (bScore > aScore) winnerId = f.bId;
       else {
         // Exact tie on rapid-fire answers → coin flip between finalists
         winnerId = Math.random() < 0.5 ? f.aId : f.bId;
       }
     }
-    state.winnerId = winnerId;
     state.finalsAnswerScores = f
-      ? { [f.aId]: f.aScore, [f.bId]: f.bScore }
+      ? { [f.aId]: Number(f.aScore) || 0, [f.bId]: Number(f.bScore) || 0 }
       : null;
+    state.winnerId = winnerId;
+    state.winnerName = getPlayer(winnerId)?.name || null;
     // Author reveal = most answers across the whole game (wheel + rapid fire)
+    // Must NOT overwrite winnerId — reveal is a separate honor.
     state.revealForId = pickAuthorRevealId();
     state.phase = "end";
+    // Drop live finals match so the end screen can’t read stale side labels
+    state.finals = null;
     publish();
+  }
+
+  /**
+   * Who won the game (rapid fire / sole survivor) — never the author-reveal seat.
+   */
+  function resolveWinnerId(st = state) {
+    if (!st) return null;
+    const scores = st.finalsAnswerScores;
+    if (scores && typeof scores === "object") {
+      const pairs = Object.entries(scores).map(([id, v]) => [id, Number(v) || 0]);
+      if (pairs.length >= 2) {
+        pairs.sort((a, b) => b[1] - a[1]);
+        if (pairs[0][1] !== pairs[1][1]) return pairs[0][0];
+        // Tied scoreboard — keep host coin-flip if it points at a finalist
+        if (
+          st.winnerId &&
+          (st.winnerId === pairs[0][0] || st.winnerId === pairs[1][0])
+        ) {
+          return st.winnerId;
+        }
+        return pairs[0][0];
+      }
+      if (pairs.length === 1) return pairs[0][0];
+    }
+    const f = st.finals;
+    if (f?.aId && f?.bId) {
+      const a = Number(f.aScore) || 0;
+      const b = Number(f.bScore) || 0;
+      if (a > b) return f.aId;
+      if (b > a) return f.bId;
+    }
+    return st.winnerId || null;
   }
 
   // ---------- client send helpers ----------
@@ -3346,8 +3688,15 @@
       li.className = "player-pill";
       if (p.isHost) li.classList.add("host");
       if (p.id === me.id) li.classList.add("you");
+      if (p.connected === false) li.classList.add("away");
       const meta =
-        p.id === me.id ? "you" : p.isHost ? "host" : "joined";
+        p.id === me.id
+          ? "you"
+          : p.connected === false
+            ? "away"
+            : p.isHost
+              ? "host"
+              : "joined";
       li.innerHTML = `<span class="name">${escapeHtml(p.name)}</span><span class="meta">${meta}</span>`;
       if (me.isHost && p.id !== me.id) {
         const kick = document.createElement("button");
@@ -3391,6 +3740,80 @@
         els.btnStartQuestions.style.display = "";
       }
     }
+
+    updateLobbyQr();
+  }
+
+  let lastLobbyQrUrl = "";
+
+  function lobbyInviteUrl() {
+    if (!state?.roomCode) return "";
+    let url = inviteUrl(state.roomCode);
+    try {
+      const params = new URLSearchParams(location.search);
+      if (params.get("local") === "1" || location.protocol === "file:") {
+        const u = new URL(url);
+        u.searchParams.set("local", "1");
+        url = u.toString();
+      }
+    } catch (_) {}
+    return url;
+  }
+
+  function updateLobbyQr() {
+    const block = els.lobbyQrBlock;
+    const canvas = els.lobbyQrCanvas;
+    if (!block || !canvas) return;
+
+    if (!me.isHost || !state?.roomCode || state.phase !== "lobby") {
+      block.hidden = true;
+      return;
+    }
+
+    const url = lobbyInviteUrl();
+    if (!url) {
+      block.hidden = true;
+      return;
+    }
+
+    block.hidden = false;
+    if (url === lastLobbyQrUrl && canvas.width > 0) return;
+    lastLobbyQrUrl = url;
+
+    const paint = () => {
+      if (typeof QRCode === "undefined" || typeof QRCode.toCanvas !== "function") {
+        // CDN fallback image if the library didn’t load
+        const img = block.querySelector("img.lobby-qr-fallback") || document.createElement("img");
+        img.className = "lobby-qr-fallback";
+        img.alt = "QR code to join this room";
+        img.width = 200;
+        img.height = 200;
+        img.src =
+          "https://api.qrserver.com/v1/create-qr-code/?size=200x200&margin=8&data=" +
+          encodeURIComponent(url);
+        canvas.hidden = true;
+        if (!img.parentNode) block.insertBefore(img, canvas.nextSibling);
+        return;
+      }
+      canvas.hidden = false;
+      const fallback = block.querySelector("img.lobby-qr-fallback");
+      if (fallback) fallback.remove();
+      QRCode.toCanvas(
+        canvas,
+        url,
+        {
+          width: 200,
+          margin: 2,
+          color: { dark: "#1c1b19", light: "#ffffff" },
+          errorCorrectionLevel: "M",
+        },
+        (err) => {
+          if (err) console.error("QR code failed:", err);
+        }
+      );
+    };
+
+    paint();
   }
 
   function shuffleCopy(arr) {
@@ -4059,7 +4482,42 @@
     }
   }
 
+  function renderTargetHostKicks() {
+    const list = els.targetHostKickList;
+    if (!list) return;
+    if (!me.isHost || !state || !isTargetPhase()) {
+      list.hidden = true;
+      list.innerHTML = "";
+      return;
+    }
+    const others = (state.players || []).filter(
+      (p) => p.id !== me.id && p.id !== state.hostId
+    );
+    if (!others.length) {
+      list.hidden = true;
+      list.innerHTML = "";
+      return;
+    }
+    list.hidden = false;
+    list.innerHTML = "";
+    others.forEach((p) => {
+      const li = document.createElement("li");
+      li.className = "host-kick-row";
+      const label = p.kicked ? `${p.name} (out)` : p.name;
+      li.innerHTML = `<span>${escapeHtml(label)}</span>`;
+      const kick = document.createElement("button");
+      kick.type = "button";
+      kick.className = "btn-kick";
+      kick.textContent = "Remove";
+      kick.title = `Remove ${p.name} from the room`;
+      kick.onclick = () => hostKickPlayer(p.id, p.name);
+      li.appendChild(kick);
+      list.appendChild(li);
+    });
+  }
+
   function renderTarget() {
+    renderTargetHostKicks();
     const root = els.targetStage;
     if (!root || !state?.target) return;
     const t = state.target;
@@ -4072,6 +4530,193 @@
     const item = currentTargetItem();
     const chainLen = t.chain?.length || targetChainLength(totalN);
     const chainPos = Math.min((t.chainIndex || 0) + 1, chainLen || 1);
+
+    // --- SETUP: never wipe an in-progress form when someone else locks in ---
+    if (t.stage === "setup") {
+      const stillWriting =
+        amParticipant &&
+        !self?.kicked &&
+        !(mySub?.text && mySub?.targetId);
+      const existingForm = root.querySelector(".target-form");
+      const existingCard = root.querySelector(".target-card");
+
+      if (stillWriting && existingForm && existingCard) {
+        const liveText = existingForm.querySelector("#target-q-input")?.value;
+        const livePick = existingForm.querySelector(
+          'input[name="target-pick"]:checked'
+        )?.value;
+        if (typeof liveText === "string") targetSetupDraft.text = liveText;
+        if (livePick) targetSetupDraft.targetId = livePick;
+
+        const prog = existingCard.querySelector(".target-progress");
+        if (prog) prog.textContent = `${readyN} / ${totalN} players ready`;
+
+        let list = existingCard.querySelector(".target-ready-list");
+        if (!list) {
+          list = document.createElement("ul");
+          list.className = "target-ready-list";
+          existingCard.appendChild(list);
+        }
+        list.innerHTML = "";
+        parts.forEach((p) => {
+          const li = document.createElement("li");
+          const done = !!(
+            t.submissions?.[p.id]?.text && t.submissions?.[p.id]?.targetId
+          );
+          if (done) li.classList.add("is-ready");
+          li.innerHTML = `<span>${escapeHtml(p.name)}${
+            p.id === me.id ? " (you)" : ""
+          }</span><span>${done ? "ready" : "writing…"}</span>`;
+          list.appendChild(li);
+        });
+
+        // Rebuild pick options only if the alive roster changed
+        const grid = existingForm.querySelector("#target-pick-grid");
+        if (grid) {
+          const wantIds = parts.filter((p) => p.id !== me.id).map((p) => p.id);
+          const haveIds = [
+            ...grid.querySelectorAll('input[name="target-pick"]'),
+          ].map((el) => el.value);
+          const same =
+            wantIds.length === haveIds.length &&
+            wantIds.every((id) => haveIds.includes(id));
+          if (!same) {
+            const keepId = targetSetupDraft.targetId;
+            grid.innerHTML = "";
+            wantIds.forEach((id) => {
+              const p = getPlayer(id);
+              if (!p) return;
+              const lab = document.createElement("label");
+              lab.className = "target-pick";
+              if (keepId === id) lab.classList.add("is-selected");
+              lab.innerHTML = `<input type="radio" name="target-pick" value="${id.replace(
+                /"/g,
+                ""
+              )}" ${
+                keepId === id ? "checked" : ""
+              } /> <span>${escapeHtml(p.name)}</span>`;
+              lab.querySelector("input").addEventListener("change", () => {
+                targetSetupDraft.targetId = id;
+                grid
+                  .querySelectorAll(".target-pick")
+                  .forEach((el) => el.classList.remove("is-selected"));
+                lab.classList.add("is-selected");
+              });
+              grid.appendChild(lab);
+            });
+            if (keepId && !wantIds.includes(keepId)) {
+              targetSetupDraft.targetId = null;
+            }
+          }
+        }
+        return;
+      }
+
+      root.innerHTML = "";
+      const card = document.createElement("div");
+      card.className = "target-card";
+
+      const prog = document.createElement("p");
+      prog.className = "target-progress";
+      prog.textContent = `${readyN} / ${totalN} players ready`;
+      card.appendChild(prog);
+
+      if (!amParticipant || self?.kicked) {
+        const note = document.createElement("p");
+        note.className = "lead";
+        note.textContent = "You’re spectating this TARGET round.";
+        card.appendChild(note);
+      } else if (mySub?.text && mySub?.targetId) {
+        targetSetupDraft = { text: "", targetId: null };
+        const note = document.createElement("p");
+        note.className = "lead";
+        note.textContent = "You’re in. Waiting on everyone else…";
+        card.appendChild(note);
+      } else {
+        const form = document.createElement("form");
+        form.className = "target-form";
+        form.setAttribute("novalidate", "");
+        form.innerHTML = `
+          <label>
+            <span>Your anonymous question</span>
+            <textarea id="target-q-input" maxlength="200" placeholder="Ask something only they can answer…"></textarea>
+          </label>
+          <div>
+            <span style="display:block;font-size:0.75rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);margin-bottom:0.35rem">Choose your target</span>
+            <div class="target-pick-grid" id="target-pick-grid"></div>
+          </div>
+          <button type="submit" class="btn btn-primary btn-lg">Lock in</button>
+        `;
+        const textarea = form.querySelector("#target-q-input");
+        if (textarea) {
+          textarea.value = targetSetupDraft.text || "";
+          textarea.addEventListener("input", () => {
+            targetSetupDraft.text = textarea.value;
+          });
+        }
+        const grid = form.querySelector("#target-pick-grid");
+        parts
+          .filter((p) => p.id !== me.id)
+          .forEach((p) => {
+            const lab = document.createElement("label");
+            lab.className = "target-pick";
+            const selected = targetSetupDraft.targetId === p.id;
+            if (selected) lab.classList.add("is-selected");
+            lab.innerHTML = `<input type="radio" name="target-pick" value="${p.id.replace(
+              /"/g,
+              ""
+            )}" ${selected ? "checked" : ""} /> <span>${escapeHtml(
+              p.name
+            )}</span>`;
+            lab.querySelector("input").addEventListener("change", () => {
+              targetSetupDraft.targetId = p.id;
+              grid
+                .querySelectorAll(".target-pick")
+                .forEach((el) => el.classList.remove("is-selected"));
+              lab.classList.add("is-selected");
+            });
+            grid.appendChild(lab);
+          });
+        form.onsubmit = (e) => {
+          e.preventDefault();
+          const text = form.querySelector("#target-q-input")?.value?.trim();
+          const targetId = form.querySelector(
+            'input[name="target-pick"]:checked'
+          )?.value;
+          if (!text || !targetId) {
+            toast(
+              !text
+                ? "Type your TARGET question first."
+                : "Choose who you’re targeting."
+            );
+            return;
+          }
+          targetSetupDraft = { text: "", targetId: null };
+          send({ type: "targetSubmit", playerId: me.id, text, targetId });
+        };
+        card.appendChild(form);
+      }
+
+      const list = document.createElement("ul");
+      list.className = "target-ready-list";
+      parts.forEach((p) => {
+        const li = document.createElement("li");
+        const done = !!(
+          t.submissions?.[p.id]?.text && t.submissions?.[p.id]?.targetId
+        );
+        if (done) li.classList.add("is-ready");
+        li.innerHTML = `<span>${escapeHtml(p.name)}${
+          p.id === me.id ? " (you)" : ""
+        }</span><span>${done ? "ready" : "writing…"}</span>`;
+        list.appendChild(li);
+      });
+      card.appendChild(list);
+      root.appendChild(card);
+      return;
+    }
+
+    // Left writing phase — clear local draft
+    targetSetupDraft = { text: "", targetId: null };
 
     root.innerHTML = "";
     const card = document.createElement("div");
@@ -4097,73 +4742,6 @@
         note.textContent = "Waiting for the host to begin…";
         card.appendChild(note);
       }
-      root.appendChild(card);
-      return;
-    }
-
-    if (t.stage === "setup") {
-      const prog = document.createElement("p");
-      prog.className = "target-progress";
-      prog.textContent = `${readyN} / ${totalN} players ready`;
-      card.appendChild(prog);
-
-      if (!amParticipant || self?.kicked) {
-        const note = document.createElement("p");
-        note.className = "lead";
-        note.textContent = "You’re spectating this TARGET round.";
-        card.appendChild(note);
-      } else if (mySub?.text && mySub?.targetId) {
-        const note = document.createElement("p");
-        note.className = "lead";
-        note.textContent = "You’re in. Waiting on everyone else…";
-        card.appendChild(note);
-      } else {
-        const form = document.createElement("form");
-        form.className = "target-form";
-        form.innerHTML = `
-          <label>
-            <span>Your anonymous question</span>
-            <textarea id="target-q-input" maxlength="200" required placeholder="Ask something only they can answer…"></textarea>
-          </label>
-          <div>
-            <span style="display:block;font-size:0.75rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--muted);margin-bottom:0.35rem">Choose your target</span>
-            <div class="target-pick-grid" id="target-pick-grid"></div>
-          </div>
-          <button type="submit" class="btn btn-primary btn-lg">Lock in</button>
-        `;
-        const grid = form.querySelector("#target-pick-grid");
-        parts
-          .filter((p) => p.id !== me.id)
-          .forEach((p) => {
-            const lab = document.createElement("label");
-            lab.className = "target-pick";
-            lab.innerHTML = `<input type="radio" name="target-pick" value="${p.id.replace(/"/g, "")}" required /> <span>${escapeHtml(p.name)}</span>`;
-            lab.querySelector("input").addEventListener("change", () => {
-              grid.querySelectorAll(".target-pick").forEach((el) => el.classList.remove("is-selected"));
-              lab.classList.add("is-selected");
-            });
-            grid.appendChild(lab);
-          });
-        form.onsubmit = (e) => {
-          e.preventDefault();
-          const text = form.querySelector("#target-q-input")?.value?.trim();
-          const targetId = form.querySelector('input[name="target-pick"]:checked')?.value;
-          if (!text || !targetId) return;
-          send({ type: "targetSubmit", playerId: me.id, text, targetId });
-        };
-        card.appendChild(form);
-      }
-
-      const list = document.createElement("ul");
-      list.className = "target-ready-list";
-      parts.forEach((p) => {
-        const li = document.createElement("li");
-        const done = !!(t.submissions?.[p.id]?.text && t.submissions?.[p.id]?.targetId);
-        if (done) li.classList.add("is-ready");
-        li.innerHTML = `<span>${escapeHtml(p.name)}${p.id === me.id ? " (you)" : ""}</span><span>${done ? "ready" : "writing…"}</span>`;
-        list.appendChild(li);
-      });
-      card.appendChild(list);
       root.appendChild(card);
       return;
     }
@@ -4471,33 +5049,81 @@
     const amB = me.id === f.bId;
     const self = getPlayer(me.id);
     const amFinalist = (amA || amB) && self && !self.kicked;
+    const isOut = !!self?.kicked;
     const canBuzz = f.phase === "open" && amFinalist;
     const someoneBuzzed = !!f.buzzedBy;
     const q = f.questions[f.index];
+
+    const screen = els.screenFinals || document.getElementById("screen-finals");
+    if (screen) {
+      screen.classList.toggle("is-finalist", !!amFinalist);
+      screen.classList.toggle("is-spectator", !amFinalist && !isOut);
+      screen.classList.toggle("is-out", isOut);
+    }
+    els.finalsSideA?.classList.toggle("is-you", amA && amFinalist);
+    els.finalsSideB?.classList.toggle("is-you", amB && amFinalist);
+
+    if (els.finalsRole) {
+      els.finalsRole.hidden = false;
+      els.finalsRole.classList.remove(
+        "finals-role--in",
+        "finals-role--watch",
+        "finals-role--out"
+      );
+      if (amFinalist) {
+        els.finalsRole.classList.add("finals-role--in");
+        els.finalsRole.textContent = amA
+          ? `You’re in the buzzer round · vs ${b?.name || "—"}`
+          : `You’re in the buzzer round · vs ${a?.name || "—"}`;
+      } else if (isOut) {
+        els.finalsRole.classList.add("finals-role--out");
+        els.finalsRole.textContent = "You’re out · spectating the final";
+      } else {
+        els.finalsRole.classList.add("finals-role--watch");
+        els.finalsRole.textContent = `Spectating · ${a?.name || "—"} vs ${
+          b?.name || "—"
+        }`;
+      }
+    }
 
     if (els.buzzerMain) {
       els.buzzerMain.disabled = !canBuzz;
       els.buzzerMain.classList.toggle("lit", someoneBuzzed);
       els.buzzerMain.classList.toggle("is-pressed", someoneBuzzed);
+      const label = els.buzzerMain.querySelector(".giant-buzzer-label");
+      if (label) {
+        label.textContent = amFinalist ? "BUZZ" : isOut ? "OUT" : "WATCH";
+      }
     }
 
     els.finalsControls.innerHTML = "";
 
-    if (self?.kicked) {
-      els.finalsPhaseLabel.textContent = "You’re out";
-      els.finalsQuestion.textContent = `${a?.name || "—"} vs ${b?.name || "—"} in rapid fire. Spectate only — you can’t buzz.`;
-      if (els.buzzerHint) els.buzzerHint.textContent = "You’re out — spectate only";
+    if (isOut) {
+      els.finalsPhaseLabel.textContent = "Spectating";
+      els.finalsQuestion.textContent = `${a?.name || "—"} vs ${
+        b?.name || "—"
+      } in rapid fire. You’re out — watch only.`;
+      if (els.buzzerHint)
+        els.buzzerHint.textContent = "No buzzer for you — enjoy the show";
       return;
     }
 
     // Legacy ready → kick into show/open
     if (f.phase === "ready") {
       if (me.isHost) send({ type: "startFinalsClock" });
-      els.finalsPhaseLabel.textContent = "Rapid Fire";
-      els.finalsQuestion.textContent = "Starting…";
+      els.finalsPhaseLabel.textContent = amFinalist
+        ? "You’re up"
+        : "Spectating";
+      els.finalsQuestion.textContent = amFinalist
+        ? "Rapid fire starting — get ready to buzz."
+        : `${a?.name || "—"} and ${b?.name || "—"} are about to buzz. You’re watching.`;
       const totalReady = f.questions?.length || 0;
       els.finalsTimer.textContent = totalReady ? `1 / ${totalReady}` : "—";
-      if (els.buzzerHint) els.buzzerHint.textContent = "Starting…";
+      if (els.buzzerHint) {
+        els.buzzerHint.textContent = amFinalist
+          ? "Your buzzer is coming…"
+          : "Spectator mode — you can’t buzz";
+      }
       return;
     }
 
@@ -4537,29 +5163,39 @@
     const buzzedName = getPlayer(f.buzzedBy)?.name || "Player";
 
     if (f.phase === "show") {
-      els.finalsPhaseLabel.textContent = "Read it…";
+      els.finalsPhaseLabel.textContent = amFinalist
+        ? "Read it — you’re buzzing"
+        : "Spectating — read along";
       if (els.buzzerHint) {
         els.buzzerHint.textContent = amFinalist
-          ? "Buzzer arms in a moment…"
-          : "Spectating…";
+          ? "Your buzzer arms in a moment…"
+          : "Spectator mode — only the two finalists can buzz";
       }
       return;
     }
 
     if (f.phase === "open") {
-      els.finalsPhaseLabel.textContent = "Buzz in!";
+      els.finalsPhaseLabel.textContent = amFinalist
+        ? "Buzz in!"
+        : "Spectating the buzz";
       if (els.buzzerHint) {
-        els.buzzerHint.textContent = amFinalist ? "Smash it!" : "Spectating";
+        els.buzzerHint.textContent = amFinalist
+          ? "Smash it — this is your round!"
+          : `Watching ${a?.name || "—"} vs ${b?.name || "—"} — you can’t buzz`;
       }
       return;
     }
 
     if (f.phase === "confirm") {
-      els.finalsPhaseLabel.textContent = `${buzzedName} buzzed`;
+      els.finalsPhaseLabel.textContent = amFinalist
+        ? `${buzzedName} buzzed`
+        : `Spectating · ${buzzedName} buzzed`;
       if (els.buzzerHint) {
         els.buzzerHint.textContent = amBuzzed
           ? "Say your answer out loud"
-          : `${buzzedName} is answering…`;
+          : amFinalist
+            ? `${buzzedName} is answering…`
+            : `${buzzedName} is answering — you’re spectating`;
       }
       if (amBuzzed) {
         const btn = document.createElement("button");
@@ -4567,39 +5203,63 @@
         btn.className = "btn btn-ok btn-lg";
         btn.id = "btn-confirm-answered";
         btn.textContent = "Have you said the answer? — Yes";
-        btn.onclick = () => send({ type: "finalsConfirmAnswered", playerId: me.id });
+        btn.onclick = () =>
+          send({ type: "finalsConfirmAnswered", playerId: me.id });
         els.finalsControls.appendChild(btn);
       }
     }
   }
 
   function renderEnd() {
-    const winner = getPlayer(state.winnerId);
+    const winnerId = resolveWinnerId(state);
+    // Keep state honest for reveal / session if scores disagree with a stale id
+    if (winnerId && state.winnerId !== winnerId) state.winnerId = winnerId;
+
+    const winner = getPlayer(winnerId);
+    const winnerName = String(
+      winner?.name || state.winnerName || ""
+    ).trim();
     const revealFor = getPlayer(state.revealForId);
     const scores = state.finalsAnswerScores;
     const winScore =
-      scores && state.winnerId != null ? scores[state.winnerId] : null;
+      scores && winnerId != null && winnerId in scores
+        ? Number(scores[winnerId]) || 0
+        : null;
 
-    els.endTitle.textContent = winner ? `${winner.name} takes it` : "That’s a wrap";
-    if (winner && winScore != null) {
-      els.endSub.textContent = `${winner.name} won rapid fire with ${winScore} answer${winScore === 1 ? "" : "s"} (buzz in, shout it out).`;
-    } else if (winner) {
-      els.endSub.textContent = `${winner.name} wins.`;
+    els.endTitle.textContent = winnerName
+      ? `${winnerName} takes it`
+      : "That’s a wrap";
+    if (winnerName && winScore != null) {
+      els.endSub.textContent = `${winnerName} won rapid fire with ${winScore} answer${winScore === 1 ? "" : "s"} (buzz in, shout it out).`;
+    } else if (winnerName) {
+      els.endSub.textContent = `${winnerName} wins.`;
     } else {
       els.endSub.textContent = "Thanks for playing.";
     }
-    if (revealFor) {
+    if (revealFor && revealFor.id !== winnerId) {
       const n = revealFor.answered ?? 0;
       els.endSub.textContent += ` ${revealFor.name} earned the author reveal (${n} answer${n === 1 ? "" : "s"} total, including rapid fire).`;
+    } else if (revealFor && revealFor.id === winnerId) {
+      const n = revealFor.answered ?? 0;
+      els.endSub.textContent += ` They also earned the author reveal (${n} answer${n === 1 ? "" : "s"} total).`;
     }
 
-    const ranked = [...state.players].sort(
-      (a, b) => (b.answered ?? 0) - (a.answered ?? 0) || getSelections(b) - getSelections(a)
-    );
+    const ranked = [...state.players].sort((a, b) => {
+      // Winner first on the standings board
+      if (winnerId) {
+        if (a.id === winnerId && b.id !== winnerId) return -1;
+        if (b.id === winnerId && a.id !== winnerId) return 1;
+      }
+      return (
+        (b.answered ?? 0) - (a.answered ?? 0) ||
+        getSelections(b) - getSelections(a)
+      );
+    });
     els.standings.innerHTML = "";
     ranked.forEach((p, i) => {
       const li = document.createElement("li");
-      li.innerHTML = `<span>#${i + 1} ${escapeHtml(p.name)}${p.kicked ? " (out)" : ""}</span><span>${p.answered ?? 0} answered · ${getSelections(p)} picks · ${p.skips} skips</span>`;
+      const tag = p.id === winnerId ? " · winner" : p.kicked ? " (out)" : "";
+      li.innerHTML = `<span>#${i + 1} ${escapeHtml(p.name)}${tag}</span><span>${p.answered ?? 0} answered · ${getSelections(p)} picks · ${p.skips} skips</span>`;
       els.standings.appendChild(li);
     });
 
@@ -4649,16 +5309,32 @@
 
   // ---------- room bootstrap ----------
   function applyPlayers(players) {
+    let list = players || [];
+    // Mid-game: ignore DB rows the host hasn’t admitted yet
+    if (
+      state &&
+      state.phase &&
+      state.phase !== "lobby" &&
+      state.phase !== "end"
+    ) {
+      const known = new Set([
+        ...(state.players || []).map((p) => p.id),
+        ...(state.lateJoinIds || []),
+      ]);
+      if (known.size) {
+        list = list.filter((p) => known.has(p.id));
+      }
+    }
     const prevIds = new Set((state?.players || []).map((p) => p.id));
     if (!state) {
-      state = mergeGameIntoState({ roomCode: sync?.code, phase: "lobby" }, players);
+      state = mergeGameIntoState({ roomCode: sync?.code, phase: "lobby" }, list);
     } else {
       state = {
         ...state,
-        players: hydratePlayerStats(players, state),
+        players: hydratePlayerStats(list, state),
       };
     }
-    const newcomers = (players || []).filter((p) => !prevIds.has(p.id));
+    const newcomers = (list || []).filter((p) => !prevIds.has(p.id));
     // Host: keep roster synced. lateJoin vs reclaim is decided by the join action.
     if (me.isHost && newcomers.length && state.phase !== "end") {
       newcomers.forEach((p) => {
@@ -4688,7 +5364,7 @@
 
   async function createRoom(name, preferLocal) {
     const code = roomCode();
-    me = { id: uid(), name, isHost: true };
+    me = { id: getPersistentPlayerId(), name, isHost: true };
     myLocalQuestions = [];
     ideaReel = [];
     ideaReserve = [];
@@ -4706,6 +5382,7 @@
       selections: 0,
       kicked: false,
       isHost: true,
+      connected: true,
     };
     state = createState(code, player);
 
@@ -4762,15 +5439,18 @@
     const cleanName = String(name || "").trim();
     if (!cleanName) throw new Error("Enter a name.");
 
-    const storedReclaim = !resumeId ? loadReclaim(code) : null;
-    const reclaimMatch = !!(
-      storedReclaim &&
-      storedReclaim.id &&
-      String(storedReclaim.name || "").toLowerCase() === cleanName.toLowerCase()
-    );
-    const reclaimPayload = reclaimMatch ? storedReclaim : null;
+    // Identity = persistent browser playerId (or resume seat). Username is display only.
+    const persistentId = getPersistentPlayerId();
+    const myId = resumeId || persistentId;
 
-    // Block duplicate names before joining (except resuming / reclaiming as yourself)
+    const storedReclaim = loadReclaim(code);
+    // Reclaim matches by playerId — not by username
+    const reclaimPayload =
+      storedReclaim && storedReclaim.id && storedReclaim.id === myId
+        ? storedReclaim
+        : null;
+
+    // Block duplicate names before joining (other playerIds only)
     if (!resumeId) {
       if (!preferLocal) {
         const { data: existing, error } = await db()
@@ -4778,12 +5458,11 @@
           .select("id, name")
           .eq("room_id", code);
         if (error) throw new Error(error.message);
-        const myReclaimId = reclaimPayload?.id;
         if (
           (existing || []).some(
             (p) =>
-              p.name.toLowerCase() === cleanName.toLowerCase() &&
-              p.id !== myReclaimId
+              p.id !== myId &&
+              p.name.toLowerCase() === cleanName.toLowerCase()
           )
         ) {
           throw new Error(
@@ -4794,7 +5473,7 @@
     }
 
     me = {
-      id: resumeId || reclaimPayload?.id || uid(),
+      id: myId,
       name: cleanName,
       isHost: !!opts.resumeAsHost,
     };
@@ -4820,11 +5499,12 @@
     try {
       if (preferLocal) {
         let joined = false;
+        awaitingJoinApproval = false;
         sync.onState = (st) => {
           state = st;
           restoreMyLocalQuestionsFromState();
           render();
-          saveSession();
+          if (!awaitingJoinApproval) saveSession();
           if (!joined && !opts.resumeId) {
             joined = true;
             if (st.phase === "end") {
@@ -4832,10 +5512,13 @@
               return;
             }
             if (st.phase === "target_setup" || st.phase === "target_active") {
-              handleNameTaken(
-                "TARGET is currently in progress. You can join when the round is over."
-              );
-              return;
+              const alreadyHere = (st.players || []).some((p) => p.id === me.id);
+              if (!alreadyHere) {
+                handleNameTaken(
+                  "TARGET is currently in progress. You can join when the round is over."
+                );
+                return;
+              }
             }
             const taken = (st.players || []).some(
               (p) =>
@@ -4848,11 +5531,20 @@
               );
               return;
             }
+            const alreadyInRoom = (st.players || []).some((p) => p.id === me.id);
+            const needsApproval =
+              st.phase !== "lobby" && !alreadyInRoom && !reclaimPayload;
+            if (needsApproval) {
+              awaitingJoinApproval = true;
+              showJoinWait();
+            }
             send(joinMessage());
             if (reclaimPayload) {
               clearReclaim(code);
               toast("Welcome back — your progress is restored");
-            } else if (st.phase !== "lobby") {
+            } else if (alreadyInRoom) {
+              toast("Reconnected");
+            } else if (!needsApproval && st.phase !== "lobby") {
               toast("Joined mid-game — you’ll play with the existing question pool");
             }
           }
@@ -4863,6 +5555,7 @@
         if (!state && sync) throw new Error("No local room found. Create one first on this device.");
         if (!sync) return; // name was taken and cleaned up
         if (opts.resumeId) {
+          send(joinMessage());
           restoreMyLocalQuestionsFromState();
           recoverHostProgress();
           render();
@@ -4877,6 +5570,7 @@
           selections: 0,
           kicked: false,
           isHost: true,
+          connected: true,
         };
         await sync.start({ hostPlayer, resume: true });
         const players = await sync.fetchPlayers();
@@ -4900,6 +5594,9 @@
           });
           send(joinMessage());
           if (reclaimPayload) clearReclaim(code);
+        } else if (meRow) {
+          // Soft reconnect — keep seat, mark online
+          send(joinMessage());
         }
         applyPlayers(await sync.fetchPlayers());
         restoreMyLocalQuestionsFromState();
@@ -4908,6 +5605,7 @@
         render();
       } else {
         attachSyncHandlers();
+        awaitingJoinApproval = false;
         const joinPlayer = {
           id: me.id,
           name: me.name,
@@ -4916,30 +5614,61 @@
           selections: reclaimPayload?.selections ?? 0,
           kicked: !!reclaimPayload?.kicked,
           isHost: false,
+          connected: true,
         };
-        await sync.start({ joinPlayer, resume: !!resumeId });
-        if (!state) throw new Error("Room not found. Check ?room=CODE.");
+        // Always defer insert until we know whether this playerId is already seated
+        await sync.start({
+          joinPlayer,
+          resume: !!resumeId,
+          deferPlayerAdd: true,
+        });
+        if (!state) throw new Error("Room not found");
         if (!resumeId && state.phase === "end") {
           throw new Error("This game already ended.");
         }
+
         const players = state.players || [];
         const meRow = players.find((p) => p.id === me.id);
+        const alreadyInRoom = !!meRow;
+
+        if (
+          !alreadyInRoom &&
+          (state.phase === "target_setup" || state.phase === "target_active")
+        ) {
+          throw new Error(
+            "TARGET is currently in progress. You can join when the round is over."
+          );
+        }
+
         if (meRow) {
           me.isHost = !!meRow.isHost;
           sync.isHost = me.isHost;
         }
-        // Ensure host marks mid-game joiners / restores reclaimers
-        if (!resumeId) {
+
+        const needsApproval =
+          !alreadyInRoom &&
+          !reclaimPayload &&
+          state.phase !== "lobby";
+
+        if (needsApproval) {
+          awaitingJoinApproval = true;
+          showJoinWait();
+          send(joinMessage());
+        } else {
+          if (!alreadyInRoom) {
+            await sync.addPlayer(joinPlayer);
+          }
           send(joinMessage());
         }
+
         restoreMyLocalQuestionsFromState();
         if (me.isHost) recoverHostProgress();
         render();
         if (reclaimPayload) {
           clearReclaim(code);
           toast("Welcome back — your progress is restored");
-        } else if (!resumeId && state.phase !== "lobby") {
-          toast("Joined mid-game — you’ll play with the existing question pool");
+        } else if (alreadyInRoom && !resumeId) {
+          toast("Reconnected");
         }
       }
 
@@ -4949,8 +5678,10 @@
       if (preferLocal) url.searchParams.set("local", "1");
       else url.searchParams.delete("local");
       history.replaceState(null, "", url);
-      saveSession();
+      if (!awaitingJoinApproval) saveSession();
     } catch (err) {
+      hideJoinWait();
+      awaitingJoinApproval = false;
       try {
         sync?.destroy?.();
       } catch (_) {}
@@ -5005,6 +5736,7 @@
   /**
    * Leave the room. If you’re host, hand off to the earliest remaining
    * joiner so the game keeps running.
+   * Only the Leave Room button should call this — not refresh / back / tab close.
    */
   async function leaveRoom() {
     if (!state || !me?.id) return;
@@ -5012,7 +5744,7 @@
     const leavingId = me.id;
     const wasHost = me.isHost || state.hostId === leavingId;
     const leavingName = me.name;
-    // Same device can rejoin with this name and get progress back
+    // Same browser (same playerId) can restore this snapshot after an intentional leave
     const reclaimSnap = snapshotForReclaim(leavingId);
 
     try {
@@ -5069,18 +5801,44 @@
 
   let inviteMode = false;
 
+  function roomCodeEntered() {
+    return !!String(els.roomCode?.value || "").trim();
+  }
+
+  function normalizedRoomCodeInput() {
+    return String(els.roomCode?.value || "")
+      .toUpperCase()
+      .replace(/[^A-Z0-9]/g, "")
+      .slice(0, 6);
+  }
+
+  /** One primary CTA: empty code → Create room, code present → Join game */
+  function updateHomePrimaryAction() {
+    const joining = roomCodeEntered();
+    const code = normalizedRoomCodeInput();
+    if (els.homeActionHint) {
+      els.homeActionHint.textContent = joining
+        ? `Joining room ${code || "…"}`
+        : "Starting a new room";
+    }
+    if (els.btnHomePrimary) {
+      els.btnHomePrimary.textContent = joining ? "Join game" : "Create room";
+    }
+  }
+
   function resetHomeToFirstLook() {
     inviteMode = false;
     document.getElementById("screen-home")?.classList.remove("invite-receiver-mode");
-    els.btnCreate.hidden = false;
-    els.btnCreate.style.display = "";
-    const joinRow = document.querySelector("#screen-home .join-row");
-    if (joinRow) {
-      joinRow.hidden = false;
-      joinRow.style.display = "";
+    if (els.btnStartOwnGroup) els.btnStartOwnGroup.hidden = true;
+    if (els.btnHomePrimary) {
+      els.btnHomePrimary.hidden = false;
+      els.btnHomePrimary.style.display = "";
+      els.btnHomePrimary.disabled = false;
     }
+    if (els.homeActionHint) els.homeActionHint.hidden = false;
     const inviteBlock = document.getElementById("invite-join-block");
     if (inviteBlock) inviteBlock.hidden = true;
+    updateHomePrimaryAction();
   }
 
   // ---------- events ----------
@@ -5089,46 +5847,56 @@
     return params.get("local") === "1" || location.protocol === "file:";
   }
 
-  els.homeForm.addEventListener("submit", async (e) => {
-    e.preventDefault();
+  async function submitHomeAction() {
     setHomeError("");
     const name = els.playerName.value.trim();
-    if (!name) return;
-
-    // Invite-link receivers: Enter submits join, not create
-    if (inviteMode) {
-      els.btnJoin.click();
-      return;
-    }
-
-    const preferLocal = wantLocalMode();
-    els.btnCreate.disabled = true;
-    try {
-      await createRoom(name, preferLocal);
-    } catch (err) {
-      setHomeError(err.message || "Could not create room.");
-    } finally {
-      els.btnCreate.disabled = false;
-    }
-  });
-
-  els.btnJoin.addEventListener("click", async () => {
-    setHomeError("");
-    const name = els.playerName.value.trim();
-    const code = els.roomCode.value.trim();
     if (!name) {
       setHomeError("Add your name first.");
       return;
     }
+
     const preferLocal = wantLocalMode();
-    els.btnJoin.disabled = true;
+    const code = normalizedRoomCodeInput();
+    const joining = !!code;
+
+    if (els.btnHomePrimary) els.btnHomePrimary.disabled = true;
     try {
-      await joinRoom(name, code, preferLocal);
+      if (joining) {
+        // Sync cleaned code into the field for clarity
+        if (els.roomCode) els.roomCode.value = code;
+        updateHomePrimaryAction();
+        await joinRoom(name, code, preferLocal);
+      } else {
+        await createRoom(name, preferLocal);
+      }
     } catch (err) {
-      setHomeError(err.message || "Could not join room.");
+      let msg = err?.message || (joining ? "Could not join room." : "Could not create room.");
+      if (joining && /not found/i.test(msg)) msg = "Room not found";
+      setHomeError(msg);
     } finally {
-      els.btnJoin.disabled = false;
+      if (els.btnHomePrimary) els.btnHomePrimary.disabled = false;
     }
+  }
+
+  els.homeForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    await submitHomeAction();
+  });
+
+  els.roomCode?.addEventListener("input", () => {
+    const cleaned = normalizedRoomCodeInput();
+    if (els.roomCode.value !== cleaned) {
+      const start = els.roomCode.selectionStart;
+      els.roomCode.value = cleaned;
+      try {
+        els.roomCode.setSelectionRange(start, start);
+      } catch (_) {}
+    }
+    updateHomePrimaryAction();
+  });
+
+  els.btnStartOwnGroup?.addEventListener("click", () => {
+    location.href = "/";
   });
   els.btnCopyLink.addEventListener("click", async () => {
     if (!state) return;
@@ -5306,37 +6074,39 @@
     }
   });
 
-  // Best-effort host handoff if the tab closes mid-game
-  window.addEventListener("pagehide", () => {
-    if (!state || !me?.id) return;
-    if (!(me.isHost || state.hostId === me.id)) return;
-    const next = nextHostCandidate(me.id);
-    const code = state.roomCode;
-    const snap = snapshotForReclaim(me.id);
-    if (!next) {
-      if (code) {
-        saveReclaim(code, snap);
-        clearSession(code);
-      }
-      return;
-    }
+  // Soft disconnect only — NEVER treat refresh / back / tab close as Leave Room.
+  // Seat + progress stay in the room; presence flips offline until they return.
+  function notifyDisconnected() {
+    if (!state || !me?.id || !sync) return;
     try {
-      removePlayerFromState(me.id);
-      assignHost(next.id);
-      repairTurnAfterLeave(me.id);
-      sync?.broadcastState?.(state);
-      sync?.setRoomHost?.(next.id);
-      sync?.notifyHostHandoff?.({
-        newHostId: next.id,
-        leavingId: me.id,
-        leavingName: me.name,
+      sync.sendAction({
+        type: "presence",
+        playerId: me.id,
+        connected: false,
       });
-      sync?.deletePlayer?.(me.id);
     } catch (_) {}
-    if (code) {
-      saveReclaim(code, snap);
-      clearSession(code);
-    }
+  }
+
+  function notifyConnected() {
+    if (!state || !me?.id || !sync) return;
+    try {
+      sync.sendAction({
+        type: "presence",
+        playerId: me.id,
+        connected: true,
+      });
+    } catch (_) {}
+  }
+
+  window.addEventListener("pagehide", () => {
+    notifyDisconnected();
+    // Keep session so refresh / reopen reconnects to the same playerId seat
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (!state || !me?.id) return;
+    if (document.visibilityState === "hidden") notifyDisconnected();
+    else notifyConnected();
   });
 
   // Prefill / invite-only home when opening an existing room link (?room=)
@@ -5347,41 +6117,12 @@
   function enableInviteHome(code) {
     inviteMode = true;
     const normalized = code.toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6);
-    els.roomCode.value = normalized;
+    if (els.roomCode) els.roomCode.value = normalized;
+    updateHomePrimaryAction();
 
     const home = document.getElementById("screen-home");
-    const actions = document.querySelector("#screen-home .home-actions");
-    if (!home || !actions) return;
-
-    home.classList.add("invite-receiver-mode");
-    els.btnCreate.hidden = true;
-    els.btnCreate.style.display = "none";
-    const joinRow = actions.querySelector(".join-row");
-    if (joinRow) {
-      joinRow.hidden = true;
-      joinRow.style.display = "none";
-    }
-
-    let inviteBlock = document.getElementById("invite-join-block");
-    if (!inviteBlock) {
-      inviteBlock = document.createElement("div");
-      inviteBlock.id = "invite-join-block";
-      inviteBlock.className = "invite-join-block";
-      inviteBlock.innerHTML = `
-        <p class="invite-room-label">Joining room <strong id="invite-room-label">${normalized}</strong></p>
-        <button type="button" class="btn btn-primary btn-lg" id="btn-invite-join">Join group</button>
-        <button type="button" class="invite-own-group" id="btn-start-own-group">start your own group</button>
-      `;
-      actions.appendChild(inviteBlock);
-      $("#btn-invite-join").onclick = () => els.btnJoin.click();
-      $("#btn-start-own-group").onclick = () => {
-        location.href = "/";
-      };
-    } else {
-      const label = $("#invite-room-label");
-      if (label) label.textContent = normalized;
-      inviteBlock.hidden = false;
-    }
+    if (home) home.classList.add("invite-receiver-mode");
+    if (els.btnStartOwnGroup) els.btnStartOwnGroup.hidden = false;
   }
 
   (async () => {
@@ -5396,7 +6137,15 @@
     let resumed = false;
     if (presetRoom) {
       resumed = await tryResume(presetRoom);
-      if (!resumed) enableInviteHome(presetRoom);
+      if (!resumed) {
+        enableInviteHome(presetRoom);
+        // Prefill last known name for this room (same playerId reconnect)
+        const sess = loadSession(presetRoom);
+        const rec = loadReclaim(presetRoom);
+        if (els.playerName && (sess?.name || rec?.name)) {
+          els.playerName.value = sess?.name || rec?.name || "";
+        }
+      }
     } else if (isReload) {
       // Mid-game refresh: restore last room even if ?room= dropped
       const active = loadActiveRoomCode();
@@ -5409,6 +6158,7 @@
       location.replace("/");
       return;
     }
+    updateHomePrimaryAction();
     drawWheel([{ name: "…" }, { name: "…" }, { name: "…" }, { name: "…" }], 0);
   })();
 })();
