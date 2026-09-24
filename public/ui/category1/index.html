@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Syne:wght@500;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/ui/shared/iso-theme.css" />
+  <link rel="stylesheet" href="/ui/shared/how-to-play.css" />
   <link rel="stylesheet" href="/ui/category1/styles.css" />
 </head>
 <body class="iso-world">
@@ -73,6 +74,7 @@
           </div>
         </form>
         <p id="home-error" class="error-msg" hidden></p>
+        <button type="button" class="how-to-play-btn" id="btn-how-to-play">How to play</button>
         <p class="hint"><a href="/category2.html">Game mode 2: Mirror Vote →</a></p>
       </div>
     </section>
@@ -295,7 +297,7 @@
       <div class="overlay-card">
         <h2>You’re out</h2>
         <p>Three skips. The wheel moves on without you.</p>
-        <p class="hint">You can still watch — you just can’t be picked again.</p>
+        <p class="hint">You can still watch: you just can’t be picked again.</p>
         <div id="wildcard-enter-wrap" class="wildcard-enter-wrap" hidden>
           <button type="button" class="btn btn-primary btn-lg" id="btn-enter-wildcard">
             Enter WILDCARD
@@ -337,11 +339,43 @@
 
     <!-- TOAST -->
     <div id="toast" class="toast" hidden></div>
+
+    <!-- HOW TO PLAY -->
+    <div id="how-to-play-overlay" class="how-to-play-overlay" hidden>
+      <div class="how-to-play-card" role="dialog" aria-modal="true" aria-labelledby="how-to-play-title">
+        <p class="how-to-eyebrow">Game mode 1</p>
+        <h2 id="how-to-play-title">Icebreaker</h2>
+        <ul class="how-to-play-list">
+          <li>
+            <strong>Write</strong>
+            Everyone adds secret questions (about players × 5). Pool locks, then a slice is saved for the finale.
+          </li>
+          <li>
+            <strong>Wheel</strong>
+            Fair spins. Answer in 60s or skip. 3 skips = out (not in a 2-player game).
+          </li>
+          <li>
+            <strong>TARGET</strong>
+            Host-only mid-round: write a Q aimed at someone else. Skip breaks the chain and you’re out.
+          </li>
+          <li>
+            <strong>WILDCARD</strong>
+            One comeback if you’re out: confess, then the room votes. Yes must beat no (tie = stay out).
+          </li>
+          <li>
+            <strong>Rapid fire</strong>
+            Starts when 2 players remain or the wheel deck is empty. Top 2 by wheel picks buzz for the win.
+          </li>
+        </ul>
+        <button type="button" class="how-to-play-close" id="how-to-play-close">Got it</button>
+      </div>
+    </div>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
   <script src="/logic/supabase-config.js"></script>
+  <script src="/logic/how-to-play.js"></script>
   <script src="/logic/category1.js"></script>
 </body>
 </html>

@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Syne:wght@500;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/ui/shared/iso-theme.css" />
+  <link rel="stylesheet" href="/ui/shared/how-to-play.css" />
   <link rel="stylesheet" href="/ui/category2/styles.css" />
 </head>
 <body class="iso-world">
@@ -64,6 +65,7 @@
           </div>
         </form>
         <p id="home-error" class="error" hidden></p>
+        <button type="button" class="how-to-play-btn" id="btn-how-to-play">How to play</button>
         <p class="hint"><a href="/game.html">← Game mode 1: Icebreaker</a></p>
       </div>
     </section>
@@ -137,7 +139,7 @@
       </header>
       <div class="results-wrap">
         <h2 class="section-title">Votes per question</h2>
-        <p class="sub">Each chart shows how many people named each player for that prompt.</p>
+        <p class="sub">Each chart shows how many people named each player for that prompt. Tap a chart to open it full-size.</p>
         <div id="charts" class="charts"></div>
 
         <h2 class="section-title body-title">How the room built you</h2>
@@ -164,10 +166,50 @@
     </section>
 
     <div id="toast" class="toast" hidden></div>
+
+    <!-- HOW TO PLAY -->
+    <div id="how-to-play-overlay" class="how-to-play-overlay" hidden>
+      <div class="how-to-play-card" role="dialog" aria-modal="true" aria-labelledby="how-to-play-title">
+        <p class="how-to-eyebrow">Game mode 2</p>
+        <h2 id="how-to-play-title">Mirror Vote</h2>
+        <ul class="how-to-play-list">
+          <li>
+            <strong>Deck</strong>
+            Host picks Philosophical or Dirty. Everyone gets the same prompts.
+          </li>
+          <li>
+            <strong>Vote</strong>
+            For each question, tap who fits best. Your pick stays anonymous. Go at your own pace.
+          </li>
+          <li>
+            <strong>Results</strong>
+            Charts show how many votes each person got. Tap a chart to open full names. Then see the traits the room gave you.
+          </li>
+        </ul>
+        <button type="button" class="how-to-play-close" id="how-to-play-close">Got it</button>
+      </div>
+    </div>
+
+    <!-- Expanded chart (readable names with big rooms) -->
+    <div id="chart-lightbox" class="chart-lightbox" hidden>
+      <div class="chart-lightbox-card" role="dialog" aria-modal="true" aria-labelledby="chart-lightbox-title">
+        <div class="chart-lightbox-head">
+          <h2 id="chart-lightbox-title" class="chart-lightbox-title"></h2>
+          <button type="button" class="btn btn-ghost chart-lightbox-close" id="chart-lightbox-close">
+            Close
+          </button>
+        </div>
+        <p class="chart-lightbox-hint">Votes for each player on this question</p>
+        <div class="chart-lightbox-scroll" id="chart-lightbox-scroll">
+          <canvas id="chart-lightbox-canvas"></canvas>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="/logic/supabase-config.js"></script>
+  <script src="/logic/how-to-play.js"></script>
   <script src="/logic/category2.js"></script>
 </body>
 </html>

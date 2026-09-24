@@ -4,7 +4,7 @@ import { useEffect, useRef } from "react";
 
 /**
  * Hub brand mark — WB logo animation in place of the “Get Under My Skin” wordmark.
- * Plays once, holds the last frame. Background matches hub (#e2e2e2).
+ * Loops while people pick a mode. Background matches hub (#e2e2e2).
  */
 export function WbBrandLogo() {
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -16,49 +16,34 @@ export function WbBrandLogo() {
     video.muted = true;
     video.defaultMuted = true;
     video.playsInline = true;
+    video.loop = true;
     video.setAttribute("playsinline", "true");
     video.setAttribute("webkit-playsinline", "true");
     video.setAttribute("muted", "true");
+    video.setAttribute("loop", "true");
     video.disablePictureInPicture = true;
     video.controls = false;
-    video.loop = false;
 
     const tryPlay = () => {
       const p = video.play();
       if (p && typeof p.catch === "function") p.catch(() => {});
     };
 
-    const onEnded = () => {
-      // Hold final frame — don’t look like a looping clip
-      try {
-        video.pause();
-        if (Number.isFinite(video.duration) && video.duration > 0) {
-          video.currentTime = video.duration;
-        }
-      } catch (_) {}
-    };
-
-    video.addEventListener("ended", onEnded);
     video.addEventListener("loadeddata", tryPlay);
     video.addEventListener("canplay", tryPlay);
 
     const onVisible = () => {
-      if (document.visibilityState === "visible" && video.paused && !video.ended) {
-        tryPlay();
-      }
+      if (document.visibilityState === "visible" && video.paused) tryPlay();
     };
     document.addEventListener("visibilitychange", onVisible);
 
-    const unlock = () => {
-      if (!video.ended) tryPlay();
-    };
+    const unlock = () => tryPlay();
     document.addEventListener("touchstart", unlock, { passive: true, once: true });
     document.addEventListener("pointerdown", unlock, { passive: true, once: true });
 
     tryPlay();
 
     return () => {
-      video.removeEventListener("ended", onEnded);
       video.removeEventListener("loadeddata", tryPlay);
       video.removeEventListener("canplay", tryPlay);
       document.removeEventListener("visibilitychange", onVisible);
@@ -74,6 +59,7 @@ export function WbBrandLogo() {
         className="hub-brand-logo"
         autoPlay
         muted
+        loop
         playsInline
         preload="auto"
         disablePictureInPicture

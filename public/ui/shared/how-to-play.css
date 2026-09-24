@@ -1,0 +1,127 @@
+/* Shared “How to play” popover — hub modes */
+
+.how-to-play-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin: 1.1rem auto 0;
+  padding: 0.45rem 0.85rem;
+  border: 2px solid var(--line, #2a2826);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--muted, #6e6a64);
+  font-family: var(--font-body, "DM Sans", system-ui, sans-serif);
+  font-size: 0.72rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.how-to-play-btn:hover {
+  color: var(--text, #1c1b19);
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.how-to-play-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  padding:
+    max(0.85rem, env(safe-area-inset-top))
+    max(0.85rem, env(safe-area-inset-right))
+    max(0.85rem, env(safe-area-inset-bottom))
+    max(0.85rem, env(safe-area-inset-left));
+  background: rgba(28, 27, 25, 0.55);
+  backdrop-filter: blur(4px);
+  box-sizing: border-box;
+}
+
+.how-to-play-overlay[hidden] {
+  display: none !important;
+}
+
+.how-to-play-card {
+  width: min(100%, 420px);
+  max-height: min(88dvh, 640px);
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
+  padding: 1.35rem 1.25rem 1.25rem;
+  background: #f7f5f1;
+  border: 2.5px solid var(--line, #2a2826);
+  border-radius: 2px;
+  color: var(--text, #1c1b19);
+  box-sizing: border-box;
+  text-align: left;
+}
+
+.how-to-play-card .how-to-eyebrow {
+  margin: 0 0 0.35rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--muted, #6e6a64);
+}
+
+.how-to-play-card h2 {
+  margin: 0 0 0.85rem;
+  font-family: var(--font-display, "Syne", system-ui, sans-serif);
+  font-size: clamp(1.45rem, 5vw, 1.85rem);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.how-to-play-list {
+  margin: 0 0 1.15rem;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 0.65rem;
+}
+
+.how-to-play-list li {
+  margin: 0;
+  padding: 0;
+  font-size: 0.92rem;
+  line-height: 1.4;
+  color: var(--text, #1c1b19);
+}
+
+.how-to-play-list li strong {
+  display: block;
+  margin-bottom: 0.12rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted, #6e6a64);
+}
+
+.how-to-play-close {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 0.7rem 1rem;
+  border: 2.5px solid var(--line, #2a2826);
+  border-radius: 2px;
+  background: #1c1b19;
+  color: #f7f5f1;
+  font-family: var(--font-body, "DM Sans", system-ui, sans-serif);
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+}
+
+.how-to-play-close:hover {
+  background: #2a2826;
+}
+
+.home-stage > .how-to-play-btn,
+.stage > .how-to-play-btn {
+  display: flex;
+}

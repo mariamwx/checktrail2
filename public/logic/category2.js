@@ -53,6 +53,11 @@
     traitList: $("#trait-list"),
     bodyFigure: $("#body-figure"),
     toast: $("#toast"),
+    chartLightbox: $("#chart-lightbox"),
+    chartLightboxTitle: $("#chart-lightbox-title"),
+    chartLightboxClose: $("#chart-lightbox-close"),
+    chartLightboxScroll: $("#chart-lightbox-scroll"),
+    chartLightboxCanvas: $("#chart-lightbox-canvas"),
   };
 
   let me = { id: null, name: "", isHost: false };

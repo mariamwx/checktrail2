@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=Syne:wght@500;600;700;800&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/ui/shared/iso-theme.css" />
+  <link rel="stylesheet" href="/ui/shared/how-to-play.css" />
   <link rel="stylesheet" href="/ui/category3/styles.css" />
 </head>
 <body class="iso-world">
@@ -64,6 +65,7 @@
           </div>
         </form>
         <p id="home-error" class="error" hidden></p>
+        <button type="button" class="how-to-play-btn" id="btn-how-to-play">How to play</button>
         <p class="hint"><a href="/">← All game modes</a></p>
       </div>
     </section>
@@ -144,10 +146,34 @@
     </section>
 
     <div id="toast" class="toast" hidden></div>
+
+    <!-- HOW TO PLAY -->
+    <div id="how-to-play-overlay" class="how-to-play-overlay" hidden>
+      <div class="how-to-play-card" role="dialog" aria-modal="true" aria-labelledby="how-to-play-title">
+        <p class="how-to-eyebrow">Game mode 3</p>
+        <h2 id="how-to-play-title">Feud</h2>
+        <ul class="how-to-play-list">
+          <li>
+            <strong>Deck</strong>
+            Host picks Classic or Funny. You’ll get players × 5 survey questions.
+          </li>
+          <li>
+            <strong>Answer</strong>
+            Multiple choice A–D, at your own pace. Picks stay anonymous.
+          </li>
+          <li>
+            <strong>Score</strong>
+            +1 each time you match the room’s top answer. Highest score wins.
+          </li>
+        </ul>
+        <button type="button" class="how-to-play-close" id="how-to-play-close">Got it</button>
+      </div>
+    </div>
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script src="/logic/supabase-config.js"></script>
+  <script src="/logic/how-to-play.js"></script>
   <script src="/logic/category3.js"></script>
 </body>
 </html>
